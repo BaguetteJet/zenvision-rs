@@ -1,5 +1,4 @@
-#![allow(dead_code)]
-
+mod anim;
 mod commands;
 mod usb;
 
@@ -68,6 +67,16 @@ enum Command {
     },
     /// Display current panel state
     State,
+    /// Play an animation
+    Demo {
+        /// Frames per second
+        #[arg(
+            long,
+            default_value_t = 20,
+            value_parser = clap::value_parser!(u32).range(1..=60)
+        )]
+        fps: u32,
+    },
 }
 
 fn main() -> io::Result<()> {
@@ -87,6 +96,7 @@ fn main() -> io::Result<()> {
         Command::Boot { value } => commands::set_boot_animation(&mut dev, value == "on")?,
         Command::Sweep { value } => commands::set_screen_sweep(&mut dev, value == "on")?,
         Command::Battery { value } => commands::set_battery(&mut dev, value == "on")?,
+        Command::Demo { fps } => anim::run(&mut dev, fps)?,
     }
 
     Ok(())

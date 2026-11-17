@@ -19,6 +19,7 @@ The binary is `target/release/zenvision`
 ./target/release/zenvision theme 2
 ./target/release/zenvision on
 ./target/release/zenvision off
+./target/release/zenvision demo
 ```
 
 ## Permissions
