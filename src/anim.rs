@@ -31,12 +31,24 @@ static DECAY: [u8; 256] = {
 
 // Stream the starfield until the process is interrupted.
 pub fn run(dev: &mut Dev, fps: u32) -> io::Result<()> {
+    println!("streaming starfield at {fps} fps");
+    start(dev)?;
+    run_with(dev, fps, |_| Ok(true))
+}
+
+// Hand the panel over to host frames (content mode 2, sweep off).
+pub fn start(dev: &mut Dev) -> io::Result<()> {
+    commands::set_content_mode(dev, 2)?;
+    commands::set_screen_sweep(dev, false)
+}
+
+// Stream frames, asking `tick` before every send whether the host still owns
+// the panel. Used by the daemon to interleave commands with frames.
+pub fn run_with<F>(dev: &mut Dev, fps: u32, mut tick: F) -> io::Result<()>
+where
+    F: FnMut(&mut Dev) -> io::Result<bool>,
+{
     assert!(fps > 0, "fps must be greater than zero");
-
-    commands::set_content_mode(dev, 2)?; // custom stream
-    commands::set_screen_sweep(dev, false)?;
-
-    println!("streaming starfield at {fps} fps (Ctrl-C to stop)");
 
     let period = Duration::from_secs_f64(1.0 / fps as f64);
     let mut stars = Starfield::new(fps);
@@ -44,8 +56,10 @@ pub fn run(dev: &mut Dev, fps: u32) -> io::Result<()> {
     let mut deadline = Instant::now();
 
     loop {
-        stars.draw(&mut frame);
-        frame = send_frame(dev, frame)?;
+        if tick(dev)? {
+            stars.draw(&mut frame);
+            frame = send_frame(dev, frame)?;
+        }
 
         // Sleep until the next frame is due so transfer time does not lower the
         // frame rate; if we fell behind, restart the schedule instead of bursting.

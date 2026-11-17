@@ -1,24 +1,27 @@
 mod anim;
 mod commands;
+mod daemon;
 mod usb;
 
 use std::io;
 
 use clap::{Parser, Subcommand};
 
+use crate::usb::Dev;
+
 #[derive(Parser)]
 #[command(
     name = "zenvision",
     version,
-    about = "ZenVision OLED Display Controller"
+    about = "ZenVision lid display driver for ASUS Zenbook 14X Space Edition"
 )]
-struct Cli {
+pub(crate) struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
-enum Command {
+pub(crate) enum Command {
     /// Turn panel on
     On,
     /// Turn panel off
@@ -77,27 +80,63 @@ enum Command {
         )]
         fps: u32,
     },
+    /// Run in the background and accept commands
+    Daemon,
 }
 
 fn main() -> io::Result<()> {
-    let cli = Cli::parse();
-    let mut dev = usb::open_device()?;
+    let args: Vec<String> = std::env::args().collect();
+    let cli = Cli::parse_from(&args);
 
-    match cli.command {
-        Command::On => commands::power_on(&mut dev)?,
-        Command::Off => commands::power_off(&mut dev)?,
-        Command::State => println!("{}", commands::get_engine_state(&mut dev)?),
-        Command::Theme { value } => commands::set_theme(&mut dev, value)?,
-        Command::Speed { value } => commands::set_speed(&mut dev, value)?,
-        Command::Clock { value } => commands::set_clock(&mut dev, value)?,
-        Command::Time { value } => commands::set_time(&mut dev, value == "24")?,
-        Command::Mode { value } => commands::set_content_mode(&mut dev, value)?,
-        Command::Brightness { value } => commands::set_brightness(&mut dev, value)?,
-        Command::Boot { value } => commands::set_boot_animation(&mut dev, value == "on")?,
-        Command::Sweep { value } => commands::set_screen_sweep(&mut dev, value == "on")?,
-        Command::Battery { value } => commands::set_battery(&mut dev, value == "on")?,
-        Command::Demo { fps } => anim::run(&mut dev, fps)?,
+    if matches!(&cli.command, Command::Daemon) {
+        return daemon::run();
     }
 
-    Ok(())
+    // If a daemon owns the panel, hand the command over instead of fighting it.
+    if let Some(reply) = daemon::send(&args[1..])? {
+        if let Some(error) = reply.strip_prefix("error: ") {
+            return Err(io::Error::other(error.to_string()));
+        }
+        if !reply.is_empty() && reply != "ok" {
+            println!("{reply}");
+        }
+        return Ok(());
+    }
+
+    let mut dev = usb::open_device()?;
+    match &cli.command {
+        Command::Demo { fps } => anim::run(&mut dev, *fps),
+        Command::Daemon => unreachable!(),
+        command => {
+            if let Some(out) = execute(&mut dev, command)? {
+                println!("{out}");
+            }
+            Ok(())
+        }
+    }
+}
+
+// Apply one panel command; returns text only for commands that report state.
+pub(crate) fn execute(dev: &mut Dev, cmd: &Command) -> io::Result<Option<String>> {
+    match cmd {
+        Command::On => commands::power_on(dev)?,
+        Command::Off => commands::power_off(dev)?,
+        Command::State => return Ok(Some(commands::get_engine_state(dev)?)),
+        Command::Theme { value } => commands::set_theme(dev, *value)?,
+        Command::Speed { value } => commands::set_speed(dev, *value)?,
+        Command::Clock { value } => commands::set_clock(dev, *value)?,
+        Command::Time { value } => commands::set_time(dev, value.as_str() == "24")?,
+        Command::Mode { value } => commands::set_content_mode(dev, *value)?,
+        Command::Brightness { value } => commands::set_brightness(dev, *value)?,
+        Command::Boot { value } => commands::set_boot_animation(dev, value.as_str() == "on")?,
+        Command::Sweep { value } => commands::set_screen_sweep(dev, value.as_str() == "on")?,
+        Command::Battery { value } => commands::set_battery(dev, value.as_str() == "on")?,
+        Command::Demo { .. } | Command::Daemon => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "not a panel command",
+            ));
+        }
+    }
+    Ok(None)
 }

@@ -22,6 +22,48 @@ The binary is `target/release/zenvision`
 ./target/release/zenvision demo
 ```
 
+## Daemon
+
+`daemon` owns the panel in the background and sets its clock once on start. It
+starts idle: run `demo` to start the starfield, and the daemon keeps streaming
+it until a command takes the panel back. Commands are forwarded over a Unix
+socket (`$XDG_RUNTIME_DIR/zenvision.sock`) when a daemon is running, otherwise
+they talk to the panel directly.
+
+```sh
+./target/release/zenvision brightness 80
+./target/release/zenvision theme 2
+./target/release/zenvision off      # powers off and pauses the animation
+./target/release/zenvision demo     # resumes the animation
+./target/release/zenvision state
+```
+
+Stop the daemon with Ctrl-C (or `kill`). The socket is recreated on the next
+start, so a stale socket file is harmless.
+
+## Run as a service
+
+A user unit is included in `systemd/zenvision.service`. Install it with:
+
+```sh
+cargo build --release
+install -Dm755 target/release/zenvision ~/.local/bin/zenvision
+install -Dm644 systemd/zenvision.service ~/.config/systemd/user/zenvision.service
+systemctl --user daemon-reload
+systemctl --user enable --now zenvision.service
+```
+
+```sh
+systemctl --user status zenvision.service
+journalctl --user -u zenvision.service -f
+systemctl --user restart zenvision.service
+systemctl --user stop zenvision.service
+```
+
+The daemon sets the panel clock once when it starts (24-hour format). To keep
+it running after logout, enable lingering once:
+`loginctl enable-linger "$USER"`.
+
 ## Permissions
 
 If access is denied, add a udev rule:

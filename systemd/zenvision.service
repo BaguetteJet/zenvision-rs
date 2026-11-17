@@ -1,0 +1,11 @@
+[Unit]
+Description=ZenVision lid display daemon
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/zenvision daemon
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
