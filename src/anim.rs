@@ -18,6 +18,9 @@ const PIXELS_PER_PAGE: usize = (PACKET_BYTES - 4) * 2;
 const STARS: usize = 90;
 const TRAILS: u16 = 66;
 
+// Rate used by the foreground demo and by a freshly started daemon.
+pub const DEFAULT_FPS: u32 = 20;
+
 // Exact per-pixel trail decay, precomputed to keep the hot loop to one lookup.
 static DECAY: [u8; 256] = {
     let mut table = [0u8; 256];
@@ -33,7 +36,7 @@ static DECAY: [u8; 256] = {
 pub fn run(dev: &mut Dev, fps: u32) -> io::Result<()> {
     println!("streaming starfield at {fps} fps");
     start(dev)?;
-    run_with(dev, fps, |_| Ok(true))
+    run_with(dev, |_| Ok(Tick::Stream(fps)))
 }
 
 // Hand the panel over to host frames (content mode 2, sweep off).
@@ -42,23 +45,45 @@ pub fn start(dev: &mut Dev) -> io::Result<()> {
     commands::set_screen_sweep(dev, false)
 }
 
-// Stream frames, asking `tick` before every send whether the host still owns
-// the panel. Used by the daemon to interleave commands with frames.
-pub fn run_with<F>(dev: &mut Dev, fps: u32, mut tick: F) -> io::Result<()>
-where
-    F: FnMut(&mut Dev) -> io::Result<bool>,
-{
-    assert!(fps > 0, "fps must be greater than zero");
+// What the caller wants the next tick to do.
+pub enum Tick {
+    Idle,
+    Stream(u32),
+}
 
-    let period = Duration::from_secs_f64(1.0 / fps as f64);
-    let mut stars = Starfield::new(fps);
+const IDLE_PERIOD: Duration = Duration::from_millis(20);
+
+// Stream frames, asking `tick` before every send what to do. Used by the daemon
+// to interleave commands with frames and to change the frame rate at runtime.
+pub fn run_with<F>(dev: &mut Dev, mut tick: F) -> io::Result<()>
+where
+    F: FnMut(&mut Dev) -> io::Result<Tick>,
+{
+    let mut fps = 0;
+    let mut period = IDLE_PERIOD;
+    let mut stars: Option<Starfield> = None;
     let mut frame = Buffer::from(vec![0u8; FRAME_BYTES]);
     let mut deadline = Instant::now();
 
     loop {
-        if tick(dev)? {
-            stars.draw(&mut frame);
-            frame = send_frame(dev, frame)?;
+        match tick(dev)? {
+            Tick::Stream(target) => {
+                assert!(target > 0, "fps must be greater than zero");
+                if target != fps {
+                    fps = target;
+                    period = Duration::from_secs_f64(1.0 / fps as f64);
+                    match &mut stars {
+                        Some(stars) => stars.set_fps(fps),
+                        None => stars = Some(Starfield::new(fps)),
+                    }
+                }
+                stars.as_mut().unwrap().draw(&mut frame);
+                frame = send_frame(dev, frame)?;
+            }
+            Tick::Idle => {
+                fps = 0;
+                period = IDLE_PERIOD;
+            }
         }
 
         // Sleep until the next frame is due so transfer time does not lower the
@@ -101,17 +126,21 @@ impl Starfield {
             });
         }
 
-        // Audio is off, so the reference applet uses a constant 0.1 level.
-        let dt = (1.0 / fps as f32).min(0.1);
-        let speed = (0.25 + 1.4 * 0.1) * dt;
-
-        Self {
+        let mut field = Self {
             stars,
             trail: vec![0; WIDTH * HEIGHT],
             lit: Vec::new(),
             rng,
-            speed,
-        }
+            speed: 0.0,
+        };
+        field.set_fps(fps);
+        field
+    }
+
+    fn set_fps(&mut self, fps: u32) {
+        // Audio is off, so the reference applet uses a constant 0.1 level.
+        let dt = (1.0 / fps as f32).min(0.1);
+        self.speed = (0.25 + 1.4 * 0.1) * dt;
     }
 
     // Render one frame straight into the wire format: no intermediate image.

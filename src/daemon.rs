@@ -5,11 +5,9 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use crate::anim::Tick;
 use crate::usb::{Dev, open_device};
 use crate::{Cli, Command, anim, commands, execute};
-
-// Fixed frame rate for the background stream.
-const FPS: u32 = 20;
 
 // Per-user socket: XDG_RUNTIME_DIR when available, otherwise the temp dir.
 fn socket_path() -> PathBuf {
@@ -67,18 +65,20 @@ pub fn run() -> io::Result<()> {
     let mut daemon = Daemon {
         listener,
         streaming: false,
+        fps: anim::DEFAULT_FPS,
     };
-    anim::run_with(&mut dev, FPS, |dev| daemon.tick(dev))
+    anim::run_with(&mut dev, |dev| daemon.tick(dev))
 }
 
 struct Daemon {
     listener: UnixListener,
     streaming: bool,
+    fps: u32,
 }
 
 impl Daemon {
-    // Serve pending clients; returns whether to send a frame this tick.
-    fn tick(&mut self, dev: &mut Dev) -> io::Result<bool> {
+    // Serve pending clients; returns what to render this tick.
+    fn tick(&mut self, dev: &mut Dev) -> io::Result<Tick> {
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => self.serve(stream, dev),
@@ -86,7 +86,11 @@ impl Daemon {
                 Err(e) => return Err(e),
             }
         }
-        Ok(self.streaming)
+        Ok(if self.streaming {
+            Tick::Stream(self.fps)
+        } else {
+            Tick::Idle
+        })
     }
 
     fn serve(&mut self, stream: UnixStream, dev: &mut Dev) {
@@ -108,9 +112,10 @@ impl Daemon {
     fn apply(&mut self, command: Command, dev: &mut Dev) -> String {
         match command {
             Command::Daemon => "error: daemon already running".into(),
-            Command::Demo { .. } => match anim::start(dev) {
+            Command::Demo { fps } => match anim::start(dev) {
                 Ok(()) => {
-                    self.set_streaming(true);
+                    let fps = fps.unwrap_or(self.fps);
+                    self.start_stream(fps);
                     "ok".into()
                 }
                 Err(e) => format!("error: {e}"),
@@ -123,7 +128,12 @@ impl Daemon {
                         Command::Mode { value } => value == 2,
                         _ => self.streaming,
                     };
-                    self.set_streaming(streaming);
+                    if streaming {
+                        let fps = self.fps;
+                        self.start_stream(fps);
+                    } else {
+                        self.pause_stream();
+                    }
                     output.unwrap_or_else(|| "ok".into())
                 }
                 Err(e) => format!("error: {e}"),
@@ -131,10 +141,18 @@ impl Daemon {
         }
     }
 
-    fn set_streaming(&mut self, on: bool) {
-        if self.streaming != on {
-            self.streaming = on;
-            println!("{}", if on { "streaming" } else { "streaming paused" });
+    fn start_stream(&mut self, fps: u32) {
+        if !self.streaming || self.fps != fps {
+            println!("streaming at {fps} fps");
+        }
+        self.fps = fps;
+        self.streaming = true;
+    }
+
+    fn pause_stream(&mut self) {
+        if self.streaming {
+            self.streaming = false;
+            println!("streaming paused");
         }
     }
 }

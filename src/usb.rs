@@ -12,6 +12,8 @@ const FRAMEBUFFER_EP: u8 = 0x07; // bulk OUT, framebuffer
 const RESPONSE_EP: u8 = 0x82; // interrupt IN, response channel
 
 const TIMEOUT: Duration = Duration::from_secs(3);
+
+pub const COMMAND_BYTES: usize = 512;
 pub const FRAME_BYTES: usize = 8704;
 
 pub struct Dev {
@@ -56,9 +58,9 @@ pub fn send_frame(dev: &mut Dev, frame: Buffer) -> io::Result<Buffer> {
 // Send a command zero-padded to 512 bytes, read the reply on EP 0x82.
 // Returns None if the panel does not answer before the timeout.
 pub fn send_command(dev: &mut Dev, payload: &[u8]) -> io::Result<Option<Vec<u8>>> {
-    assert!(payload.len() <= 512, "command payload exceeds 512 bytes");
+    assert!(payload.len() <= COMMAND_BYTES, "command payload exceeds {} bytes", COMMAND_BYTES);
 
-    let mut buf = vec![0u8; 512];
+    let mut buf = vec![0u8; COMMAND_BYTES];
     buf[..payload.len()].copy_from_slice(payload);
 
     let sent = dev.command.transfer_blocking(buf.into(), TIMEOUT);
@@ -68,7 +70,7 @@ pub fn send_command(dev: &mut Dev, payload: &[u8]) -> io::Result<Option<Vec<u8>>
         Err(e) => return Err(e.into()),
     }
 
-    let reply = dev.response.allocate(512);
+    let reply = dev.response.allocate(COMMAND_BYTES);
     let received = dev.response.transfer_blocking(reply, TIMEOUT);
     match received.status {
         Ok(()) => Ok(Some(received.buffer[..received.actual_len].to_vec())),

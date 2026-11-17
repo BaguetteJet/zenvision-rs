@@ -72,13 +72,9 @@ pub(crate) enum Command {
     State,
     /// Play an animation
     Demo {
-        /// Frames per second
-        #[arg(
-            long,
-            default_value_t = 20,
-            value_parser = clap::value_parser!(u32).range(1..=60)
-        )]
-        fps: u32,
+        /// Frames per second (default 20; omit to keep the daemon's rate)
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=60))]
+        fps: Option<u32>,
     },
     /// Run in the background and accept commands
     Daemon,
@@ -105,7 +101,7 @@ fn main() -> io::Result<()> {
 
     let mut dev = usb::open_device()?;
     match &cli.command {
-        Command::Demo { fps } => anim::run(&mut dev, *fps),
+        Command::Demo { fps } => anim::run(&mut dev, fps.unwrap_or(anim::DEFAULT_FPS)),
         Command::Daemon => unreachable!(),
         command => {
             if let Some(out) = execute(&mut dev, command)? {
