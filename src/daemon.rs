@@ -5,9 +5,10 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::anim::Tick;
-use crate::usb::{Dev, open_device};
-use crate::{Cli, Command, anim, commands, execute};
+use crate::animation::{AnimationKind, DEFAULT_FPS};
+use crate::device::{Device, open_device};
+use crate::player::Player;
+use crate::{Cli, Command, StreamEffect, commands, execute};
 
 // Per-user socket: XDG_RUNTIME_DIR when available, otherwise the temp dir.
 fn socket_path() -> PathBuf {
@@ -64,36 +65,36 @@ pub fn run() -> io::Result<()> {
 
     let mut daemon = Daemon {
         listener,
-        streaming: false,
-        fps: anim::DEFAULT_FPS,
+        player: Player::new(AnimationKind::default(), DEFAULT_FPS),
     };
-    anim::run_with(&mut dev, |dev| daemon.tick(dev))
+    daemon.run(&mut dev)
 }
 
 struct Daemon {
     listener: UnixListener,
-    streaming: bool,
-    fps: u32,
+    player: Player,
 }
 
 impl Daemon {
-    // Serve pending clients; returns what to render this tick.
-    fn tick(&mut self, dev: &mut Dev) -> io::Result<Tick> {
+    fn run(&mut self, dev: &mut Device) -> io::Result<()> {
+        loop {
+            self.serve_pending(dev)?;
+            self.player.step(dev)?;
+        }
+    }
+
+    // Serve every client that is queued, without blocking the frame loop.
+    fn serve_pending(&mut self, dev: &mut Device) -> io::Result<()> {
         loop {
             match self.listener.accept() {
                 Ok((stream, _)) => self.serve(stream, dev),
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
                 Err(e) => return Err(e),
             }
         }
-        Ok(if self.streaming {
-            Tick::Stream(self.fps)
-        } else {
-            Tick::Idle
-        })
     }
 
-    fn serve(&mut self, stream: UnixStream, dev: &mut Dev) {
+    fn serve(&mut self, stream: UnixStream, dev: &mut Device) {
         let mut request = String::new();
         if BufReader::new(&stream).read_line(&mut request).is_err() {
             return; // client went away, not fatal
@@ -109,50 +110,64 @@ impl Daemon {
         let _ = writeln!(&stream, "{reply}");
     }
 
-    fn apply(&mut self, command: Command, dev: &mut Dev) -> String {
+    fn apply(&mut self, command: Command, dev: &mut Device) -> String {
         match command {
             Command::Daemon => "error: daemon already running".into(),
-            Command::Demo { fps } => match anim::start(dev) {
-                Ok(()) => {
-                    let fps = fps.unwrap_or(self.fps);
-                    self.start_stream(fps);
-                    "ok".into()
-                }
-                Err(e) => format!("error: {e}"),
-            },
-            command => match execute(dev, &command) {
-                Ok(output) => {
-                    // Commands that switch the panel to built-in content stop frames.
-                    let streaming = match command {
-                        Command::Off | Command::On => false,
-                        Command::Mode { value } => value == 2,
-                        _ => self.streaming,
-                    };
-                    if streaming {
-                        let fps = self.fps;
-                        self.start_stream(fps);
-                    } else {
-                        self.pause_stream();
+            Command::Demo { animation, fps } => {
+                let kind = animation.unwrap_or_else(|| self.player.kind().clone());
+                let fps = fps.unwrap_or(self.player.fps());
+                let changed = !self.player.playing()
+                    || kind != *self.player.kind()
+                    || fps != self.player.fps();
+                let name = kind.name();
+
+                match commands::start_frames(dev) {
+                    Ok(()) => {
+                        self.player.play(kind, fps);
+                        if changed {
+                            println!("streaming {name} at {fps} fps");
+                        }
+                        "ok".into()
                     }
-                    output.unwrap_or_else(|| "ok".into())
+                    Err(e) => format!("error: {e}"),
                 }
-                Err(e) => format!("error: {e}"),
-            },
+            }
+            command => {
+                let effect = command.stream_effect();
+                match execute(dev, &command) {
+                    Ok(output) => {
+                        if let Err(e) = self.apply_stream_effect(dev, effect) {
+                            return format!("error: {e}");
+                        }
+                        output.unwrap_or_else(|| "ok".into())
+                    }
+                    Err(e) => format!("error: {e}"),
+                }
+            }
         }
     }
 
-    fn start_stream(&mut self, fps: u32) {
-        if !self.streaming || self.fps != fps {
-            println!("streaming at {fps} fps");
+    fn apply_stream_effect(&mut self, dev: &mut Device, effect: StreamEffect) -> io::Result<()> {
+        match effect {
+            StreamEffect::Keep => {}
+            StreamEffect::Play => {
+                commands::start_frames(dev)?;
+                if !self.player.playing() {
+                    self.player.resume();
+                    println!(
+                        "streaming {} at {} fps",
+                        self.player.kind().name(),
+                        self.player.fps()
+                    );
+                }
+            }
+            StreamEffect::Pause => {
+                if self.player.playing() {
+                    self.player.pause();
+                    println!("streaming paused");
+                }
+            }
         }
-        self.fps = fps;
-        self.streaming = true;
-    }
-
-    fn pause_stream(&mut self) {
-        if self.streaming {
-            self.streaming = false;
-            println!("streaming paused");
-        }
+        Ok(())
     }
 }

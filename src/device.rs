@@ -16,7 +16,7 @@ const TIMEOUT: Duration = Duration::from_secs(3);
 pub const COMMAND_BYTES: usize = 512;
 pub const FRAME_BYTES: usize = 8704;
 
-pub struct Dev {
+pub struct Device {
     command: Endpoint<Interrupt, Out>,
     framebuffer: Endpoint<Bulk, Out>,
     response: Endpoint<Interrupt, In>,
@@ -24,7 +24,7 @@ pub struct Dev {
 }
 
 // Open the panel and claim its vendor interface.
-pub fn open_device() -> io::Result<Dev> {
+pub fn open_device() -> io::Result<Device> {
     let info = nusb::list_devices()
         .wait()?
         .find(|d| d.vendor_id() == VENDOR_ID && d.product_id() == PRODUCT_ID)
@@ -37,7 +37,7 @@ pub fn open_device() -> io::Result<Dev> {
     let framebuffer = interface.endpoint::<Bulk, Out>(FRAMEBUFFER_EP)?;
     let response = interface.endpoint::<Interrupt, In>(RESPONSE_EP)?;
 
-    Ok(Dev {
+    Ok(Device {
         command,
         framebuffer,
         response,
@@ -46,7 +46,7 @@ pub fn open_device() -> io::Result<Dev> {
 }
 
 // Send one 8704-byte framed image on EP 0x07, giving the buffer back for reuse.
-pub fn send_frame(dev: &mut Dev, frame: Buffer) -> io::Result<Buffer> {
+pub fn send_frame(dev: &mut Device, frame: Buffer) -> io::Result<Buffer> {
     assert_eq!(frame.len(), FRAME_BYTES, "invalid frame size");
 
     dev.framebuffer
@@ -57,8 +57,12 @@ pub fn send_frame(dev: &mut Dev, frame: Buffer) -> io::Result<Buffer> {
 
 // Send a command zero-padded to 512 bytes, read the reply on EP 0x82.
 // Returns None if the panel does not answer before the timeout.
-pub fn send_command(dev: &mut Dev, payload: &[u8]) -> io::Result<Option<Vec<u8>>> {
-    assert!(payload.len() <= COMMAND_BYTES, "command payload exceeds {} bytes", COMMAND_BYTES);
+pub fn send_command(dev: &mut Device, payload: &[u8]) -> io::Result<Option<Vec<u8>>> {
+    assert!(
+        payload.len() <= COMMAND_BYTES,
+        "command payload exceeds {} bytes",
+        COMMAND_BYTES
+    );
 
     let mut buf = vec![0u8; COMMAND_BYTES];
     buf[..payload.len()].copy_from_slice(payload);

@@ -1,13 +1,17 @@
-mod anim;
+mod animation;
+mod canvas;
 mod commands;
 mod daemon;
-mod usb;
+mod device;
+mod player;
 
 use std::io;
 
 use clap::{Parser, Subcommand};
 
-use crate::usb::Dev;
+use crate::animation::{AnimationKind, DEFAULT_FPS};
+use crate::device::Device;
+use crate::player::Player;
 
 #[derive(Parser)]
 #[command(
@@ -70,14 +74,40 @@ pub(crate) enum Command {
     },
     /// Display current panel state
     State,
-    /// Play an animation
+    /// Play custom animation
     Demo {
-        /// Frames per second (default 20; omit to keep the daemon's rate)
-        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=60))]
+        /// Animation to play
+        #[command(subcommand)]
+        animation: Option<AnimationKind>,
+        /// Frames per second
+        #[arg(
+            long,
+            global = true,
+            value_parser = clap::value_parser!(u32).range(1..=60)
+        )]
         fps: Option<u32>,
     },
-    /// Run in the background and accept commands
+    /// Start background proccess
     Daemon,
+}
+
+// What a panel command means for host-frame playback.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamEffect {
+    Keep,
+    Play,
+    Pause,
+}
+
+impl Command {
+    pub(crate) fn stream_effect(&self) -> StreamEffect {
+        match self {
+            Command::On | Command::Off => StreamEffect::Pause,
+            Command::Mode { value } if *value == 2 => StreamEffect::Play,
+            Command::Mode { .. } => StreamEffect::Pause,
+            _ => StreamEffect::Keep,
+        }
+    }
 }
 
 fn main() -> io::Result<()> {
@@ -99,9 +129,21 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    let mut dev = usb::open_device()?;
+    let mut dev = device::open_device()?;
     match &cli.command {
-        Command::Demo { fps } => anim::run(&mut dev, fps.unwrap_or(anim::DEFAULT_FPS)),
+        Command::Demo { animation, fps } => {
+            let kind = animation.clone().unwrap_or_default();
+            let fps = fps.unwrap_or(DEFAULT_FPS);
+
+            commands::start_frames(&mut dev)?;
+            println!("streaming {} at {fps} fps", kind.name());
+
+            let mut player = Player::new(kind, fps);
+            player.resume();
+            loop {
+                player.step(&mut dev)?;
+            }
+        }
         Command::Daemon => unreachable!(),
         command => {
             if let Some(out) = execute(&mut dev, command)? {
@@ -113,7 +155,7 @@ fn main() -> io::Result<()> {
 }
 
 // Apply one panel command; returns text only for commands that report state.
-pub(crate) fn execute(dev: &mut Dev, cmd: &Command) -> io::Result<Option<String>> {
+pub(crate) fn execute(dev: &mut Device, cmd: &Command) -> io::Result<Option<String>> {
     match cmd {
         Command::On => commands::power_on(dev)?,
         Command::Off => commands::power_off(dev)?,

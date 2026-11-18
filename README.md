@@ -2,6 +2,23 @@
 
 Control ASUS ZenVision OLED panel on linux
 
+## Usage
+
+```sh
+zenvision --help
+zenvision on
+zenvision off
+zenvision state
+zenvision time 24
+zenvision theme 4
+zenvision speed 2
+zenvision brightness 80
+zenvision demo starfield --stars 90 --trail 66 --fps 30
+```
+
+`demo [ANIMATION]` streams host-rendered animations. Run `zenvision demo --help`
+or `zenvision demo starfield --help` for the available options.
+
 ## Build
 
 ```sh
@@ -9,17 +26,6 @@ cargo build --release
 ```
 
 The binary is `target/release/zenvision`
-
-## Usage
-
-```sh
-./target/release/zenvision --help
-./target/release/zenvision state
-./target/release/zenvision time 24
-./target/release/zenvision theme 2
-./target/release/zenvision on
-./target/release/zenvision off
-```
 
 ## Daemon
 
