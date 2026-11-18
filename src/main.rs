@@ -75,7 +75,7 @@ pub(crate) enum Command {
     /// Display current panel state
     State,
     /// Play custom animation
-    Demo {
+    Anim {
         /// Animation to play
         #[command(subcommand)]
         animation: Option<AnimationKind>,
@@ -131,7 +131,7 @@ fn main() -> io::Result<()> {
 
     let mut dev = device::open_device()?;
     match &cli.command {
-        Command::Demo { animation, fps } => {
+        Command::Anim { animation, fps } => {
             let kind = animation.clone().unwrap_or_default();
             let fps = fps.unwrap_or(DEFAULT_FPS);
 
@@ -169,7 +169,7 @@ pub(crate) fn execute(dev: &mut Device, cmd: &Command) -> io::Result<Option<Stri
         Command::Boot { value } => commands::set_boot_animation(dev, value.as_str() == "on")?,
         Command::Sweep { value } => commands::set_screen_sweep(dev, value.as_str() == "on")?,
         Command::Battery { value } => commands::set_battery(dev, value.as_str() == "on")?,
-        Command::Demo { .. } | Command::Daemon => {
+        Command::Anim { .. } | Command::Daemon => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "not a panel command",

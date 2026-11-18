@@ -3,14 +3,24 @@ use std::time::Duration;
 use super::Animation;
 use crate::canvas::{Canvas, HEIGHT, WIDTH};
 
-const DEFAULT_STARS: usize = 90;
+const DEFAULT_STARS: u32 = 90;
 const DEFAULT_TRAIL: u8 = 66;
+const DEFAULT_SPEED: f32 = 1.0;
 
 #[derive(Clone, Debug, PartialEq, clap::Args)]
 pub struct Options {
     /// Number of stars
-    #[arg(long, default_value_t = DEFAULT_STARS)]
-    stars: usize,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_STARS,
+        value_parser = clap::value_parser!(u32).range(0..=1_000_000)
+    )]
+    stars: u32,
+    /// Speed multiplier
+    #[arg(
+        long, default_value_t = DEFAULT_SPEED,
+    )]
+    speed: f32,
     /// Trail pixels percentage
     #[arg(
         long, default_value_t = DEFAULT_TRAIL,
@@ -23,6 +33,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             stars: DEFAULT_STARS,
+            speed: DEFAULT_SPEED,
             trail: DEFAULT_TRAIL,
         }
     }
@@ -31,6 +42,7 @@ impl Default for Options {
 pub struct Starfield {
     stars: Vec<Star>,
     rng: Rng,
+    speed: f32,
     trail: u8,
 }
 
@@ -44,7 +56,7 @@ struct Star {
 impl Starfield {
     pub fn new(options: Options) -> Self {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
-        let mut stars = Vec::with_capacity(options.stars);
+        let mut stars = Vec::with_capacity(options.stars as usize);
         for _ in 0..options.stars {
             stars.push(Star {
                 x: rng.range(-1.0, 1.0),
@@ -57,6 +69,7 @@ impl Starfield {
         Self {
             stars,
             rng,
+            speed: options.speed,
             trail: options.trail,
         }
     }
@@ -66,7 +79,7 @@ impl Animation for Starfield {
     fn draw(&mut self, canvas: &mut Canvas, dt: Duration) {
         // Audio is off, so the reference applet uses a constant 0.1 level.
         let dt = dt.as_secs_f32().min(0.1);
-        let speed = (0.25 + 1.4 * 0.1) * dt;
+        let speed = (0.25 + 1.4 * 0.1) * self.speed * dt;
 
         let rng = &mut self.rng;
         for star in &mut self.stars {

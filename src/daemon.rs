@@ -113,7 +113,7 @@ impl Daemon {
     fn apply(&mut self, command: Command, dev: &mut Device) -> String {
         match command {
             Command::Daemon => "error: daemon already running".into(),
-            Command::Demo { animation, fps } => {
+            Command::Anim { animation, fps } => {
                 let kind = animation.unwrap_or_else(|| self.player.kind().clone());
                 let fps = fps.unwrap_or(self.player.fps());
                 let changed = !self.player.playing()

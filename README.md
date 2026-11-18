@@ -2,38 +2,7 @@
 
 Control ASUS ZenVision OLED panel on linux
 
-## Usage
-
-```sh
-zenvision --help
-zenvision on
-zenvision off
-zenvision state
-zenvision time 24
-zenvision theme 4
-zenvision speed 2
-zenvision brightness 80
-zenvision demo starfield --stars 90 --trail 66 --fps 30
-```
-
-`demo [ANIMATION]` streams host-rendered animations. Run `zenvision demo --help`
-or `zenvision demo starfield --help` for the available options.
-
-## Build
-
-```sh
-cargo build --release
-```
-
-The binary is `target/release/zenvision`
-
-## Daemon
-
-`daemon` owns the panel in the background and sets its clock once on start. Commands are forwarded over a Unix socket (`$XDG_RUNTIME_DIR/zenvision.sock`) when a daemon is running, otherwise they talk to the panel directly.
-
-## Run as a service
-
-A user unit is included in `systemd/zenvision.service`. Install it with:
+## Build Service
 
 ```sh
 cargo build --release
@@ -43,14 +12,16 @@ systemctl --user daemon-reload
 systemctl --user enable --now zenvision.service
 ```
 
-```sh
-systemctl --user status zenvision.service
-journalctl --user -u zenvision.service -f
-systemctl --user restart zenvision.service
-systemctl --user stop zenvision.service
-```
+## Usage
 
-To keep it running after logout, enable lingering once: `loginctl enable-linger "$USER"`.
+```sh
+zenvision --help
+zenvision on
+zenvision theme 4
+zenvision speed 2
+zenvision time 24
+zenvision anim starfield --stars 90 --trail 66 --speed 1.5 --fps 30
+```
 
 ## Permissions
 
@@ -67,3 +38,9 @@ Then reload the rules:
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
+
+## References
+
+[ZenVision Studio · BaguetteJet EDITION](https://github.com/BaguetteJet/zenvision-studio) - (Python) previous feature rich project   
+[zenvision-protocol-research](https://github.com/BaguetteJet/zenvision-protocol-research) - protocol derived from USB packet captures   
+[zenvision-linux](https://github.com/tarpediem/zenvision-linux) - first open-source Linux driver
