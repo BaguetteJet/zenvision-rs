@@ -304,6 +304,10 @@ fn render(canvas: &Canvas, out: &mut String, cols: usize, rows: usize) {
         let mut last_bg: Option<u8> = None;
         let mut transparent = false;
 
+        // The panel is 64 pixels high, so the last sextant cell has only its
+        // top third on-screen. Do not paint a background for that cell.
+        let partial_row = exact && cy + 1 == PREVIEW_ROWS && !HEIGHT.is_multiple_of(3);
+
         for cx in 0..display_cols {
             let mut block = [None; 6];
             let mut sum = 0u32;
@@ -353,7 +357,12 @@ fn render(canvas: &Canvas, out: &mut String, cols: usize, rows: usize) {
                 let _ = write!(out, "\x1b[38;2;{fg};{fg};{fg}m");
                 last_fg = Some(fg);
             }
-            match bg_sum.checked_div(bg_count) {
+            let background = if partial_row {
+                None
+            } else {
+                bg_sum.checked_div(bg_count)
+            };
+            match background {
                 Some(bg) => {
                     let bg = bg as u8;
                     if transparent || last_bg != Some(bg) {
@@ -413,6 +422,27 @@ mod tests {
 
         // The bright top-left pixel becomes the foreground of the first char.
         assert!(text.starts_with("\x1b[38;2;255;255;255m"));
+    }
+
+    #[test]
+    fn last_partial_row_has_no_background() {
+        let mut canvas = Canvas::new();
+        for x in 0..WIDTH {
+            canvas.plot(
+                x as i32,
+                (HEIGHT - 1) as i32,
+                if x % 2 == 0 { 255 } else { 10 },
+            );
+        }
+
+        let mut text = String::new();
+        render(&canvas, &mut text, PREVIEW_COLS, PREVIEW_ROWS);
+
+        // The last cell has only its top third on-screen. Its background must
+        // stay transparent so it cannot paint the missing bottom two rows.
+        let last = text.lines().last().unwrap();
+        assert!(!last.contains("\x1b[48;2;"));
+        assert!(last.contains("\x1b[49m"));
     }
 
     #[test]
