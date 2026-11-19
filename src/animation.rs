@@ -6,6 +6,7 @@
 use std::io;
 use std::time::Duration;
 
+use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
 use crate::canvas::Canvas;
@@ -41,9 +42,15 @@ pub trait Animation {
 }
 
 /// The closed set of built-in animations.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// One variant is the whole registration: serde names it in the state file and
+/// IPC, `clap` exposes it as a subcommand, and the animation owns its tuning
+/// through its `Options` type (which derives [`clap::Args`]).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Subcommand)]
 #[serde(rename_all = "snake_case")]
+#[command(rename_all = "snake_case")]
 pub enum AnimationKind {
+    /// Warp-speed starfield
     Starfield(starfield::Options),
 }
 
@@ -64,5 +71,48 @@ impl AnimationKind {
 impl Default for AnimationKind {
     fn default() -> Self {
         Self::Starfield(starfield::Options::default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{Command, FromArgMatches as _};
+
+    use super::*;
+    use crate::protocol::SpeedMultiplier;
+
+    fn parse(args: &[&str]) -> AnimationKind {
+        let command = AnimationKind::augment_subcommands(Command::new("anim"));
+        let matches = command.try_get_matches_from(args).unwrap();
+        AnimationKind::from_arg_matches(&matches).unwrap()
+    }
+
+    #[test]
+    fn animations_define_their_own_cli() {
+        let kind = parse(&[
+            "anim",
+            "starfield",
+            "--stars",
+            "10",
+            "--speed",
+            "1.5",
+            "--trail",
+            "20",
+        ]);
+
+        assert_eq!(
+            kind,
+            AnimationKind::Starfield(starfield::Options {
+                stars: 10,
+                speed: SpeedMultiplier::new(1.5).unwrap(),
+                trail: 20,
+            })
+        );
+        assert_eq!(kind.name(), "starfield");
+    }
+
+    #[test]
+    fn animation_options_default_from_the_cli() {
+        assert_eq!(parse(&["anim", "starfield"]), AnimationKind::default());
     }
 }

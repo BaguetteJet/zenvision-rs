@@ -4,6 +4,7 @@
 //! enters through [`Time::now`] so callers can pass a snapshot in for tests.
 
 use std::fmt;
+use std::str::FromStr;
 
 use chrono::{Datelike, Local, Timelike};
 use serde::{Deserialize, Serialize};
@@ -178,6 +179,18 @@ impl Theme {
     }
 }
 
+impl FromStr for Theme {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
+            .parse()
+            .ok()
+            .and_then(Self::from_value)
+            .ok_or_else(|| "theme must be a number from 1 to 4".into())
+    }
+}
+
 /// A validated built-in animation speed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -206,6 +219,18 @@ impl Speed {
     }
 }
 
+impl FromStr for Speed {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
+            .parse()
+            .ok()
+            .and_then(Self::from_value)
+            .ok_or_else(|| "speed must be a number from 1 to 3".into())
+    }
+}
+
 /// A validated clock style.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -228,6 +253,18 @@ impl ClockStyle {
             2 => Some(Self::Two),
             _ => None,
         }
+    }
+}
+
+impl FromStr for ClockStyle {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
+            .parse()
+            .ok()
+            .and_then(Self::from_value)
+            .ok_or_else(|| "clock must be a number from 1 to 2".into())
     }
 }
 
@@ -256,6 +293,18 @@ impl ContentMode {
             3 => Some(Self::Three),
             _ => None,
         }
+    }
+}
+
+impl FromStr for ContentMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
+            .parse()
+            .ok()
+            .and_then(Self::from_value)
+            .ok_or_else(|| "mode must be a number from 1 to 3".into())
     }
 }
 
@@ -321,6 +370,17 @@ impl fmt::Display for Fps {
     }
 }
 
+impl FromStr for Fps {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
+            .parse()
+            .map_err(|_| "fps must be a whole number from 1 to 60".to_string())
+            .and_then(Self::new)
+    }
+}
+
 /// A finite, non-negative animation speed multiplier.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "f32", into = "f32")]
@@ -373,6 +433,17 @@ impl From<SpeedMultiplier> for f32 {
 impl fmt::Display for SpeedMultiplier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+impl FromStr for SpeedMultiplier {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value
+            .parse::<f32>()
+            .map_err(|_| "speed must be a finite number".to_string())
+            .and_then(Self::new)
     }
 }
 
@@ -482,6 +553,11 @@ mod tests {
         assert!(SpeedMultiplier::new(f32::NAN).is_err());
         assert!(SpeedMultiplier::new(f32::INFINITY).is_err());
         assert!(SpeedMultiplier::new(1.5).is_ok());
+
+        assert_eq!("2".parse::<Speed>(), Ok(Speed::Normal));
+        assert!("1.5".parse::<Speed>().is_err());
+        assert_eq!("1.5".parse::<SpeedMultiplier>().unwrap().get(), 1.5);
+        assert!("1.5".parse::<Theme>().is_err());
 
         assert_eq!(Theme::from_value(4), Some(Theme::Four));
         assert_eq!(Theme::from_value(0), None);

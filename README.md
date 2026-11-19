@@ -112,11 +112,16 @@ executes external commands; it only receives pixels.
 
 ### Native Rust animations
 
-Add a module under `src/animation/`, implement `Animation`, and add one variant
-to `AnimationKind` in `src/animation.rs`. `Animation::draw` returns
-`Status::{New, Unchanged, Ended}` and may return an error, so animations can
-skip redundant USB transfers, finish, or fail. `Animation::input` receives
-short socket messages for reactive effects.
+Create a module under `src/animation/` with an `Options` type that derives serde
+and `clap::Args`, plus a type implementing `Animation`. The command-line flags,
+defaults, help text and persisted JSON all come from `Options`, so the animation
+owns its tuning and there is nothing to mirror elsewhere.
+
+Then add one variant to `AnimationKind` in `src/animation.rs`. That enum is the
+whole registration: it is the serde tag, the clap subcommand and the factory
+switch at once. `Animation::draw` returns `Status::{New, Unchanged, Ended}` and
+may return an error, so animations can skip redundant USB transfers, finish, or
+fail. `Animation::input` receives short socket messages for reactive effects.
 
 ## Persistence
 

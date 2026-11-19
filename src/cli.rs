@@ -1,20 +1,19 @@
-//! Command-line interface. Clap lives here and nowhere else.
+//! Command-line interface. Clap lives here and in each animation's options.
 
 use std::io::{self, Read, Write};
+use std::str::FromStr;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::animation::{AnimationKind, starfield};
+use crate::animation::AnimationKind;
 use crate::app;
 use crate::canvas::GRAYSCALE_BYTES;
 use crate::ipc::{self, Reply};
 use crate::panel::{Panel, RealPanel, TerminalPanel};
 use crate::preview;
-use crate::protocol::{
-    ClockStyle, ContentMode, Fps, PanelCommand, Speed, SpeedMultiplier, Theme, TimeFormat,
-};
+use crate::protocol::{ClockStyle, ContentMode, Fps, PanelCommand, Speed, Theme, TimeFormat};
 use crate::render::Player;
 
 #[derive(Parser)]
@@ -37,24 +36,24 @@ enum Command {
     Off,
     /// Set display theme <1-4>
     Theme {
-        #[arg(value_parser = parse_theme)]
+        #[arg(value_parser = Theme::from_str)]
         value: Theme,
     },
     /// Set built-in animation speed <1-3>
     Speed {
-        #[arg(value_parser = parse_speed)]
+        #[arg(value_parser = Speed::from_str)]
         value: Speed,
     },
     /// Set clock style <1-2>
     Clock {
-        #[arg(value_parser = parse_clock)]
+        #[arg(value_parser = ClockStyle::from_str)]
         value: ClockStyle,
     },
     /// Set time format <12|24>
     Time { value: TimeArg },
     /// Set content mode <1-3>
     Mode {
-        #[arg(value_parser = parse_mode)]
+        #[arg(value_parser = ContentMode::from_str)]
         value: ContentMode,
     },
     /// Set display brightness <0-255>
@@ -79,44 +78,18 @@ enum Command {
 
 #[derive(Args)]
 struct AnimArgs {
+    /// Native animation and its options
     #[command(subcommand)]
-    animation: Option<AnimationArg>,
+    animation: Option<AnimationKind>,
     /// Frames per second
-    #[arg(long, global = true, value_parser = parse_fps)]
+    #[arg(long, global = true, value_parser = Fps::from_str)]
     fps: Option<Fps>,
-}
-
-#[derive(Subcommand)]
-enum AnimationArg {
-    /// Warp-speed starfield
-    Starfield(StarfieldArgs),
-}
-
-#[derive(Args)]
-struct StarfieldArgs {
-    /// Number of stars
-    #[arg(
-        long,
-        default_value_t = starfield::DEFAULT_STARS,
-        value_parser = clap::value_parser!(u32).range(0..=i64::from(starfield::MAX_STARS))
-    )]
-    stars: u32,
-    /// Speed multiplier
-    #[arg(long, default_value = "1.0", value_parser = parse_multiplier)]
-    speed: SpeedMultiplier,
-    /// Trail pixels percentage
-    #[arg(
-        long,
-        default_value_t = starfield::DEFAULT_TRAIL,
-        value_parser = clap::value_parser!(u8).range(0..=100)
-    )]
-    trail: u8,
 }
 
 #[derive(Args)]
 struct StreamArgs {
     /// Pace the producer at this rate
-    #[arg(long, default_value = "30", value_parser = parse_fps)]
+    #[arg(long, default_value = "30", value_parser = Fps::from_str)]
     fps: Fps,
 }
 
@@ -147,60 +120,6 @@ impl OnOff {
     const fn is_on(self) -> bool {
         matches!(self, Self::On)
     }
-}
-
-impl From<AnimationArg> for AnimationKind {
-    fn from(value: AnimationArg) -> Self {
-        match value {
-            AnimationArg::Starfield(args) => Self::Starfield(starfield::Options {
-                stars: args.stars,
-                speed: args.speed,
-                trail: args.trail,
-            }),
-        }
-    }
-}
-
-fn parse_theme(value: &str) -> Result<Theme, String> {
-    let number = value
-        .parse()
-        .map_err(|_| "theme must be a number from 1 to 4".to_string())?;
-    Theme::from_value(number).ok_or_else(|| "theme must be a number from 1 to 4".into())
-}
-
-fn parse_speed(value: &str) -> Result<Speed, String> {
-    let number = value
-        .parse()
-        .map_err(|_| "speed must be a number from 1 to 3".to_string())?;
-    Speed::from_value(number).ok_or_else(|| "speed must be a number from 1 to 3".into())
-}
-
-fn parse_clock(value: &str) -> Result<ClockStyle, String> {
-    let number = value
-        .parse()
-        .map_err(|_| "clock must be a number from 1 to 2".to_string())?;
-    ClockStyle::from_value(number).ok_or_else(|| "clock must be a number from 1 to 2".into())
-}
-
-fn parse_mode(value: &str) -> Result<ContentMode, String> {
-    let number = value
-        .parse()
-        .map_err(|_| "mode must be a number from 1 to 3".to_string())?;
-    ContentMode::from_value(number).ok_or_else(|| "mode must be a number from 1 to 3".into())
-}
-
-fn parse_fps(value: &str) -> Result<Fps, String> {
-    let number = value
-        .parse()
-        .map_err(|_| "fps must be a whole number from 1 to 60".to_string())?;
-    Fps::new(number)
-}
-
-fn parse_multiplier(value: &str) -> Result<SpeedMultiplier, String> {
-    let number = value
-        .parse()
-        .map_err(|_| "speed must be a finite number".to_string())?;
-    SpeedMultiplier::new(number)
 }
 
 /// Parse the CLI, then run the selected command.
@@ -284,9 +203,10 @@ fn handle_reply(reply: Reply) -> io::Result<()> {
 }
 
 fn animation(args: AnimArgs) -> (AnimationKind, Fps) {
-    let kind = args.animation.map(Into::into).unwrap_or_default();
-    let fps = args.fps.unwrap_or_default();
-    (kind, fps)
+    (
+        args.animation.unwrap_or_default(),
+        args.fps.unwrap_or_default(),
+    )
 }
 
 fn anim(args: AnimArgs) -> io::Result<()> {

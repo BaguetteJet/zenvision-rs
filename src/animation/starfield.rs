@@ -1,6 +1,7 @@
 //! Warp-speed starfield.
 
 use std::io;
+use std::str::FromStr;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -21,14 +22,28 @@ const Y_AT_UNIT_Z: f32 = (HEIGHT as f32 * 0.5) / SCALE;
 const SPAWN_MARGIN: f32 = 0.98;
 
 /// Starfield tuning, shared by the CLI, IPC and the state file.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+///
+/// Deriving both [`clap::Args`] and serde keeps the command-line flags, the
+/// persisted JSON and the runtime options in one place.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, clap::Args)]
 #[serde(default)]
 pub struct Options {
-    /// Number of stars.
+    /// Number of stars
+    #[arg(
+        long,
+        default_value_t = DEFAULT_STARS,
+        value_parser = clap::value_parser!(u32).range(0..=i64::from(MAX_STARS))
+    )]
     pub stars: u32,
-    /// Speed multiplier.
+    /// Speed multiplier
+    #[arg(long, default_value_t = SpeedMultiplier::DEFAULT, value_parser = SpeedMultiplier::from_str)]
     pub speed: SpeedMultiplier,
-    /// Trail retention percentage per reference frame (0-100).
+    /// Trail pixels percentage
+    #[arg(
+        long,
+        default_value_t = DEFAULT_TRAIL,
+        value_parser = clap::value_parser!(u8).range(0..=100)
+    )]
     pub trail: u8,
 }
 
