@@ -1,8 +1,14 @@
 # zenvision-rs
 
-Control ASUS ZenVision OLED panel on linux
+Control the ASUS ZenVision OLED panel on Linux.
 
-## Build Service
+The daemon owns the panel, the clock and the animation. External programs only
+supply pixels, which keeps the hot path allocation-free and makes the panel
+usable from Python, ffmpeg, or any other process that can write bytes.
+
+## Build & install
+
+Requires Rust 1.88 or newer.
 
 ```sh
 cargo build --release
@@ -20,8 +26,114 @@ zenvision on
 zenvision theme 4
 zenvision speed 2
 zenvision time 24
+zenvision brightness 160
+zenvision state
 zenvision anim starfield --stars 90 --trail 66 --speed 1.5 --fps 30
 ```
+
+`anim` forwards to the daemon when one is running; without a daemon it drives
+the panel directly and restores the built-in clock on Ctrl-C.
+
+`preview` renders to the terminal, so animations can be developed without the
+panel:
+
+```sh
+zenvision preview starfield --fps 15
+```
+
+## Custom animations
+
+### Socket (live, low latency)
+
+Connect to `$XDG_RUNTIME_DIR/zenvision-frames.sock` with
+`AF_UNIX`/`SOCK_SEQPACKET`. **One message is one frame.** Disconnecting releases
+the display and the daemon resumes its native animation.
+
+The contract is deliberately small:
+
+- raw 8-bit grayscale
+- 256 × 64 pixels
+- 16,384 bytes per message
+- row-major, one byte per pixel
+
+The daemon recycles two buffers and keeps at most one frame in flight, so a
+producer that runs faster than the panel naturally blocks (no queue, no growing
+latency). Messages shorter than 16,384 bytes are forwarded to the active
+animation's `input` hook.
+
+```python
+import os, socket, time
+import numpy as np
+
+W, H = 256, 64
+
+def run(draw, fps=30):
+    runtime = os.environ.get("XDG_RUNTIME_DIR", f"/tmp/zenvision-{os.geteuid()}")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    s.connect(os.path.join(runtime, "zenvision-frames.sock"))
+
+    frame = np.zeros((H, W), np.uint8)
+    t0, n = time.monotonic(), 0
+    while True:
+        draw(frame, time.monotonic() - t0)   # mutate in place
+        s.send(frame.tobytes())              # blocks until the daemon is ready
+        n += 1
+        time.sleep(max(0.0, t0 + n / fps - time.monotonic()))
+```
+
+### Pipe
+
+Anything that writes bytes works. Frames are paced by the daemon:
+
+```sh
+python anim.py | zenvision stream --fps 30
+ffmpeg -i clip.gif -vf scale=256:64,format=gray -f rawvideo - | zenvision stream
+```
+
+`stream` needs the daemon (it forwards to the frame socket). The daemon never
+executes external commands; it only receives pixels.
+
+### Native Rust animations
+
+Add a module under `src/animation/`, implement `Animation`, and add one variant
+to `AnimationKind` in `src/animation.rs`. `Animation::draw` returns
+`Status::{New, Unchanged, Ended}` and may return an error, so animations can
+skip redundant USB transfers, finish, or fail. `Animation::input` receives
+short socket messages for reactive effects.
+
+## Persistence
+
+The desired state is stored at
+`$XDG_STATE_HOME/zenvision/state.json` (or
+`~/.local/state/zenvision/state.json`) and re-applied after suspend, replug or
+daemon restart. It remembers the animation and its options, FPS, playing
+state, brightness and time format.
+
+## Architecture
+
+```
+protocol.rs   validated commands -> USB payload bytes (pure)
+device.rs     USB transport only
+panel.rs      Panel trait: RealPanel + TerminalPanel
+canvas.rs     grayscale canvas + 4bpp wire encoding
+animation.rs  Animation trait + built-in animation enum
+render.rs     Player: pacing, deadlines, frame timing
+state.rs      persisted desired state
+ipc.rs        versioned JSON control socket + seqpacket frame socket
+event.rs      events consumed by the loop
+app.rs        single-owner event loop, hotplug, signals, reconnect
+cli.rs        clap at the edge; preview/stream
+```
+
+The event loop is the only owner of the USB device. Helper threads push events;
+the loop sleeps with no timer while paused or while a live producer is
+connected, and it only wakes for a frame or a command in those states. A stalled
+IPC client has its own thread, a read timeout and a 64 KiB request cap, so it
+cannot block the panel.
+
+The control socket speaks one versioned JSON request and one JSON reply
+(`PROTOCOL_VERSION` in `ipc.rs`); upgrading the binary while an old daemon is
+running produces a clear version error instead of a misparse.
 
 ## Permissions
 
