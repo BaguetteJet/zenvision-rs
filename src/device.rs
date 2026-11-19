@@ -104,7 +104,14 @@ impl Device {
         let sent = self.command.transfer_blocking(buf.into(), TIMEOUT);
         match sent.status {
             Ok(()) => {}
-            Err(TransferError::Cancelled) => return Ok(None),
+            // A timed-out command transfer means the command channel is wedged;
+            // surface it so the daemon drops the device and reconnects.
+            Err(TransferError::Cancelled) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "panel command transfer timed out",
+                ));
+            }
             Err(error) => return Err(error.into()),
         }
 

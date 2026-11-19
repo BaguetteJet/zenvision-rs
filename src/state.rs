@@ -8,31 +8,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::animation::AnimationKind;
 use crate::panel::Panel;
-use crate::protocol::{ContentMode, Fps, PanelCommand, TimeFormat};
+use crate::protocol::{ClockStyle, ContentMode, Fps, PanelCommand, Speed, Theme, TimeFormat};
 use crate::render::Player;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct State {
     pub animation: AnimationKind,
     pub fps: Fps,
+    /// False by default so a fresh install leaves the built-in display alone.
     pub playing: bool,
     /// `None` until the user sets a brightness, so a fresh install leaves the
     /// panel's own default alone.
     pub brightness: Option<u8>,
     pub time_format: TimeFormat,
-}
-
-impl Default for State {
-    fn default() -> Self {
-        Self {
-            animation: AnimationKind::default(),
-            fps: Fps::default(),
-            playing: true,
-            brightness: None,
-            time_format: TimeFormat::default(),
-        }
-    }
+    /// The last built-in display choice and settings. These are recorded even
+    /// while no panel is connected, then applied on the next connect.
+    pub theme: Option<Theme>,
+    pub clock: Option<ClockStyle>,
+    pub speed: Option<Speed>,
+    pub power: Option<bool>,
 }
 
 impl State {
@@ -79,14 +74,35 @@ impl State {
         panel.apply(&PanelCommand::Time {
             format: self.time_format,
         })?;
+
+        player.play(self.animation.clone(), self.fps);
+        if self.power == Some(false) {
+            panel.apply(&PanelCommand::Off)?;
+            player.pause();
+            return Ok(());
+        }
+
+        // Power-on selects theme 4 and the battery icon, so replay the saved
+        // display choices after it rather than before.
+        if self.power == Some(true) {
+            panel.apply(&PanelCommand::On)?;
+        }
         if let Some(brightness) = self.brightness {
             panel.apply(&PanelCommand::Brightness { value: brightness })?;
         }
+        if let Some(speed) = self.speed {
+            panel.apply(&PanelCommand::Speed { value: speed })?;
+        }
+        if let Some(theme) = self.theme {
+            panel.apply(&PanelCommand::Theme { value: theme })?;
+        }
+        if let Some(clock) = self.clock {
+            panel.apply(&PanelCommand::Clock { value: clock })?;
+        }
 
-        player.play(self.animation.clone(), self.fps);
         if self.playing {
             panel.apply(&PanelCommand::Mode {
-                value: ContentMode::Two,
+                value: ContentMode::TWO,
             })?;
             panel.apply(&PanelCommand::Sweep { value: false })?;
         } else {
@@ -135,6 +151,10 @@ mod tests {
             playing: false,
             brightness: Some(120),
             time_format: TimeFormat::H12,
+            theme: Some(Theme::new(3).unwrap()),
+            clock: None,
+            speed: Some(Speed::new(2).unwrap()),
+            power: Some(true),
         };
 
         let encoded = serde_json::to_string(&state).unwrap();
@@ -143,15 +163,23 @@ mod tests {
     }
 
     #[test]
-    fn missing_fields_use_defaults() {
+    fn missing_fields_use_defaults_without_taking_over_the_panel() {
         let state: State = serde_json::from_str("{}").unwrap();
         assert_eq!(state, State::default());
-        assert!(state.playing);
+        assert!(!state.playing);
     }
 
     #[test]
     fn invalid_fps_is_rejected() {
         let error = serde_json::from_str::<State>(r#"{"fps": 0}"#).unwrap_err();
         assert!(error.to_string().contains("fps"));
+    }
+
+    #[test]
+    fn panel_values_serialize_as_numbers() {
+        let theme = Theme::new(3).unwrap();
+        assert_eq!(serde_json::to_string(&theme).unwrap(), "3");
+        assert_eq!(serde_json::from_str::<Theme>("4").unwrap(), Theme::FOUR);
+        assert!(serde_json::from_str::<Theme>("5").is_err());
     }
 }

@@ -1,9 +1,9 @@
 //! The single-owner event loop.
 //!
-//! One thread owns the USB device, the player and the persisted state. Small
-//! helper threads (IPC, frame producer, hotplug, signals) only push events.
-//! While paused or driven by a live producer the loop blocks with no timers,
-//! so an idle daemon never wakes up.
+//! One thread owns the USB device, the player and the persisted state. Helper
+//! threads (IPC, frame producer, hotplug, signals) only push events. Live
+//! frames are displayed on the loop's own deadline, so the producer is paced
+//! by `fps` and never by its own send speed.
 
 use std::io;
 use std::sync::Arc;
@@ -23,11 +23,13 @@ use crate::event::Event;
 use crate::ipc::{self, Command, Paths, Reply};
 use crate::panel::{Panel, TeePanel};
 use crate::preview::PreviewHub;
-use crate::protocol::{BUILTIN_DISPLAY, ContentMode, Fps, PanelCommand};
+use crate::protocol::{BUILTIN_DISPLAY, ContentMode, Fps, PanelCommand, Theme};
 use crate::render::Player;
 use crate::state::State;
 
 const RECONNECT_PERIOD: Duration = Duration::from_secs(2);
+const TIME_SYNC_PERIOD: Duration = Duration::from_secs(3600);
+const DRAIN_PERIOD: Duration = Duration::from_millis(100);
 
 /// Run the daemon until SIGINT/SIGTERM.
 ///
@@ -53,25 +55,24 @@ pub fn run() -> io::Result<()> {
     let preview = PreviewHub::spawn(preview_socket);
     let (frame_tx, frame_rx) = mpsc::sync_channel(1);
     let (spare_tx, spare_rx) = mpsc::sync_channel(1);
-    server.spawn(events_tx.clone(), frame_tx, spare_rx);
+    server.spawn(events_tx, frame_tx, spare_rx);
 
     println!("zenvision daemon on {}", paths.control.display());
 
-    let mut app = App {
+    let tee = preview.clone();
+    let open = move || Ok(Box::new(TeePanel::open(tee.clone())?) as Box<dyn Panel>);
+    let mut app = App::new(
         paths,
         state,
         player,
-        panel: None,
-        device_id: None,
-        live: false,
-        live_has_frame: false,
-        live_canvas: Canvas::new(),
-        frame_rx,
-        spare_tx,
-        preview,
-        last_error: None,
-    };
-    app.update_preview();
+        open,
+        FrameIo {
+            rx: frame_rx,
+            spare: spare_tx,
+        },
+        Some(preview),
+        RECONNECT_PERIOD,
+    );
     app.try_open();
     app.run(events_rx)
 }
@@ -92,7 +93,7 @@ fn spawn_hotplug(events: mpsc::Sender<Event>) {
     let watch = match nusb::watch_devices() {
         Ok(watch) => watch,
         Err(error) => {
-            eprintln!("warning: hotplug unavailable, using retry timer: {error}");
+            eprintln!("warning: hotplug unavailable, using the retry timer: {error}");
             return;
         }
     };
@@ -118,28 +119,102 @@ fn spawn_hotplug(events: mpsc::Sender<Event>) {
         });
 }
 
-struct App {
+/// The frame channel and the recycled-buffer channel.
+struct FrameIo {
+    rx: Receiver<Vec<u8>>,
+    spare: SyncSender<Vec<u8>>,
+}
+
+/// The newest live frame and its display schedule.
+struct Live {
+    /// A producer has sent a frame and owns the display while it keeps sending.
+    active: bool,
+    /// `canvas` holds a frame that was already shown.
+    has_frame: bool,
+    /// Re-send `canvas` even without a new incoming frame.
+    dirty: bool,
+    canvas: Canvas,
+    pending: Option<Vec<u8>>,
+    next: Instant,
+}
+
+impl Live {
+    fn new(now: Instant) -> Self {
+        Self {
+            active: false,
+            has_frame: false,
+            dirty: false,
+            canvas: Canvas::new(),
+            pending: None,
+            next: now,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.active = false;
+        self.has_frame = false;
+        self.dirty = false;
+        self.pending = None;
+        self.canvas.clear();
+    }
+}
+
+struct App<F> {
     paths: Paths,
     state: State,
     player: Player,
-    panel: Option<TeePanel>,
+    open: F,
+    panel: Option<Box<dyn Panel>>,
     device_id: Option<DeviceId>,
-    live: bool,
-    live_has_frame: bool,
-    live_canvas: Canvas,
-    frame_rx: Receiver<Vec<u8>>,
-    spare_tx: SyncSender<Vec<u8>>,
-    preview: PreviewHub,
+    live: Live,
+    frames: FrameIo,
+    preview: Option<PreviewHub>,
     last_error: Option<String>,
+    next_retry: Instant,
+    next_time_sync: Instant,
+    reconnect_period: Duration,
+    /// Disabled by unit tests so they never touch the real state file.
+    persist: bool,
 }
 
-impl App {
+impl<F> App<F>
+where
+    F: FnMut() -> io::Result<Box<dyn Panel>>,
+{
+    fn new(
+        paths: Paths,
+        state: State,
+        player: Player,
+        open: F,
+        frames: FrameIo,
+        preview: Option<PreviewHub>,
+        reconnect_period: Duration,
+    ) -> Self {
+        let now = Instant::now();
+        Self {
+            paths,
+            state,
+            player,
+            open,
+            panel: None,
+            device_id: None,
+            live: Live::new(now),
+            frames,
+            preview,
+            last_error: None,
+            next_retry: now,
+            next_time_sync: now + TIME_SYNC_PERIOD,
+            reconnect_period,
+            persist: true,
+        }
+    }
+
     fn run(&mut self, events: Receiver<Event>) -> io::Result<()> {
         loop {
             let event = match self.deadline() {
                 Some(deadline) => {
-                    let now = Instant::now();
-                    match events.recv_timeout(deadline.saturating_duration_since(now)) {
+                    let timeout = deadline.saturating_duration_since(Instant::now());
+                    match events.recv_timeout(timeout) {
                         Ok(event) => Some(event),
                         Err(RecvTimeoutError::Timeout) => None,
                         Err(RecvTimeoutError::Disconnected) => break,
@@ -153,29 +228,10 @@ impl App {
 
             match event {
                 None => self.on_deadline(),
-                Some(Event::Command(incoming)) => {
-                    let reply = self.apply(incoming.command);
-                    let _ = incoming.reply.send(reply);
-                }
-                Some(Event::FrameReady) => self.on_frame(),
-                Some(Event::Input(input)) => {
-                    if let Err(error) = self.player.input(&input) {
-                        eprintln!("animation input failed: {error}");
+                Some(event) => {
+                    if !self.handle(event) {
+                        return Ok(());
                     }
-                }
-                Some(Event::ProducerGone) => self.on_producer_gone(),
-                Some(Event::DeviceConnected) => self.try_open(),
-                Some(Event::DeviceDisconnected(id)) => {
-                    if self.device_id == Some(id) {
-                        self.panel_failed(io::Error::new(
-                            io::ErrorKind::ConnectionAborted,
-                            "panel disconnected",
-                        ));
-                    }
-                }
-                Some(Event::Shutdown) => {
-                    self.shutdown();
-                    return Ok(());
                 }
             }
         }
@@ -184,33 +240,97 @@ impl App {
         Ok(())
     }
 
-    /// The next timer, or `None` for a fully idle event loop.
+    /// Handle one event. Returns `false` after a clean shutdown.
+    fn handle(&mut self, event: Event) -> bool {
+        match event {
+            Event::Command(incoming) => {
+                let reply = self.apply(incoming.command);
+                let _ = incoming.reply.send(reply);
+            }
+            Event::FrameReady => self.on_frame(),
+            Event::Input(input) => {
+                if let Err(error) = self.player.input(&input) {
+                    eprintln!("animation input failed: {error}");
+                }
+            }
+            Event::ProducerGone => self.on_producer_gone(),
+            Event::DeviceConnected => self.try_open(),
+            Event::DeviceDisconnected(id) => {
+                if self.device_id == Some(id) {
+                    self.panel_failed(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "panel disconnected",
+                    ));
+                }
+            }
+            Event::Shutdown => {
+                self.shutdown();
+                return false;
+            }
+        }
+        true
+    }
+
+    /// The next timer, or `None` when there is nothing to do before an event.
     fn deadline(&self) -> Option<Instant> {
         if self.panel.is_none() {
-            return Some(Instant::now() + RECONNECT_PERIOD);
+            let mut deadline = self.next_retry;
+            if self.live.pending.is_some() || self.live.dirty {
+                deadline = deadline.min(self.live.next);
+            }
+            return Some(deadline);
         }
-        if self.live {
-            return None;
+
+        let mut deadline = self.next_time_sync;
+        if self.live.active {
+            if self.live.pending.is_some() || self.live.dirty {
+                deadline = deadline.min(self.live.next);
+            }
+        } else if let Some(next) = self.player.next_deadline() {
+            deadline = deadline.min(next);
         }
-        self.player.next_deadline()
+        Some(deadline)
     }
 
     fn on_deadline(&mut self) {
-        if self.panel.is_none() {
+        let now = Instant::now();
+
+        if self.panel.is_none() && now >= self.next_retry {
             self.try_open();
-            return;
         }
-        if self.live {
+        if (self.live.pending.is_some() || self.live.dirty) && now >= self.live.next {
+            self.display_live();
+        }
+        if self.panel.is_none() {
             return;
         }
 
-        // Native frames are now the display owner; a later live frame must be
-        // uploaded even if it matches the stale live canvas.
-        self.live_has_frame = false;
+        if now >= self.next_time_sync {
+            self.sync_time();
+            if self.panel.is_none() {
+                return;
+            }
+        }
+
+        if self.live.active {
+            return;
+        }
+
+        if self
+            .player
+            .next_deadline()
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.tick_player();
+        }
+    }
+
+    fn tick_player(&mut self) {
         let result = match self.panel.as_mut() {
-            Some(panel) => self.player.tick(panel),
-            None => Ok(Status::Unchanged),
+            Some(panel) => self.player.tick(panel.as_mut()),
+            None => return,
         };
+
         match result {
             Ok(Status::Ended) => {
                 self.state.playing = false;
@@ -222,52 +342,70 @@ impl App {
         }
     }
 
-    fn on_frame(&mut self) {
-        let frame = match self.frame_rx.recv() {
-            Ok(frame) => frame,
-            Err(_) => return,
-        };
+    fn display_live(&mut self) {
+        let now = Instant::now();
+        let frame = self.live.pending.take();
+        let displaying = self.panel.is_some() && self.state.playing;
+        let mut result = Ok(());
 
-        // A theme, clock, or powered-off panel owns the display. Keep draining
-        // the producer so it self-paces, but do not send frames over it.
-        let result = if self.state.playing {
-            let canvas = &mut self.live_canvas;
-            let changed = !self.live_has_frame || frame.as_slice() != canvas.pixels();
-            if changed {
-                canvas
-                    .set_grayscale(&frame)
-                    .and_then(|()| match self.panel.as_mut() {
-                        Some(panel) => panel.frame(canvas),
-                        None => Ok(()),
-                    })
+        if displaying && (frame.is_some() || (self.live.dirty && self.live.has_frame)) {
+            if let Some(frame) = frame.as_ref() {
+                result = self.live.canvas.set_grayscale(frame);
+            }
+            if result.is_ok() {
+                if let Some(panel) = self.panel.as_mut() {
+                    result = panel.frame(&self.live.canvas);
+                }
+            }
+            if result.is_ok() {
+                self.live.has_frame = true;
+            }
+        }
+
+        if let Some(frame) = frame {
+            let _ = self.frames.spare.send(frame);
+        }
+        self.live.dirty = false;
+        self.live.next = now
+            + if displaying {
+                period(self.player.fps())
             } else {
-                Ok(())
-            }
-        } else {
-            Ok(())
+                DRAIN_PERIOD
+            };
+
+        if let Err(error) = result {
+            self.panel_failed(error);
+        }
+    }
+
+    fn on_frame(&mut self) {
+        let Ok(frame) = self.frames.rx.recv() else {
+            return;
         };
 
-        let _ = self.spare_tx.send(frame);
+        if !self.live.active {
+            self.live.active = true;
+            self.live.next = Instant::now();
+            self.player.pause();
+        }
 
-        match result {
-            Ok(()) => {
-                self.live = true;
-                self.live_has_frame = self.state.playing;
-            }
-            Err(error) => self.panel_failed(error),
+        if let Some(old) = self.live.pending.replace(frame) {
+            let _ = self.frames.spare.send(old);
         }
     }
 
     fn on_producer_gone(&mut self) {
-        self.live = false;
-        self.live_has_frame = false;
+        let was_active = self.live.active;
+        self.live.clear();
         if self.state.playing {
             self.player.resume();
         } else {
             self.player.pause();
         }
         self.update_preview();
-        println!("frame producer disconnected");
+        if was_active {
+            println!("frame producer disconnected");
+        }
     }
 
     fn try_open(&mut self) {
@@ -275,7 +413,8 @@ impl App {
             return;
         }
 
-        let mut panel = match TeePanel::open(self.preview.clone()) {
+        let now = Instant::now();
+        let mut panel = match (self.open)() {
             Ok(panel) => panel,
             Err(error) => {
                 let message = error.to_string();
@@ -283,23 +422,31 @@ impl App {
                     eprintln!("waiting for panel: {error}");
                     self.last_error = Some(message);
                 }
+                self.next_retry = now + self.reconnect_period;
                 self.update_preview();
                 return;
             }
         };
 
         let id = panel.device_id();
-        if let Err(error) = self.state.apply(&mut panel, &mut self.player) {
+        if let Err(error) = self.state.apply(panel.as_mut(), &mut self.player) {
             eprintln!("warning: could not restore panel state: {error}; retrying");
-            self.panel_failed(error);
+            self.next_retry = now + self.reconnect_period;
+            self.update_preview();
             return;
         }
 
         self.panel = Some(panel);
         self.device_id = id;
-        self.live = false;
-        self.live_has_frame = false;
         self.last_error = None;
+        self.next_time_sync = now + TIME_SYNC_PERIOD;
+
+        if self.live.active {
+            self.player.pause();
+            self.live.dirty = self.live.has_frame;
+            self.live.next = now;
+        }
+
         self.update_preview();
         println!("panel connected");
     }
@@ -320,10 +467,14 @@ impl App {
         self.state.fps = fps;
         self.state.playing = true;
         self.save();
+
+        if self.live.active {
+            self.player.pause();
+            self.live.dirty = self.live.has_frame;
+            self.live.next = Instant::now();
+        }
         self.update_preview();
 
-        // This also takes the panel back from a theme/clock display, and
-        // re-asserts image mode for a still-connected live producer.
         match self.begin_streaming() {
             Ok(()) => Reply::ok(),
             Err(message) => Reply::error(message),
@@ -340,64 +491,92 @@ impl App {
             };
         }
 
-        match &command {
-            // Built-in displays run on the panel itself. Streaming must stop:
-            // host frames must not be sent over a theme or clock.
+        // Display choices are staged while no panel is connected and replayed
+        // on connect. Momentary settings cannot be staged, so say so.
+        let staged = match &command {
             PanelCommand::On
             | PanelCommand::Off
             | PanelCommand::Theme { .. }
             | PanelCommand::Clock { .. }
-            | PanelCommand::Mode {
-                value: ContentMode::One | ContentMode::Three,
-            } => {
-                self.state.playing = false;
-                self.player.pause();
-                self.save();
+            | PanelCommand::Time { .. }
+            | PanelCommand::Brightness { .. }
+            | PanelCommand::Speed { .. } => true,
+            PanelCommand::Mode { value } => *value == ContentMode::TWO,
+            _ => false,
+        };
+        if self.panel.is_none() && !staged {
+            return Reply::error("panel is not connected");
+        }
+
+        match &command {
+            PanelCommand::On => {
+                self.state.power = Some(true);
+                self.state.theme = Some(Theme::FOUR);
+                self.state.clock = None;
+                self.stop_streaming();
             }
-            PanelCommand::Mode {
-                value: ContentMode::Two,
-            } => {
+            PanelCommand::Off => {
+                self.state.power = Some(false);
+                self.stop_streaming();
+            }
+            PanelCommand::Theme { value } => {
+                self.state.theme = Some(*value);
+                self.state.clock = None;
+                self.stop_streaming();
+            }
+            PanelCommand::Clock { value } => {
+                self.state.clock = Some(*value);
+                self.state.theme = None;
+                self.stop_streaming();
+            }
+            PanelCommand::Mode { value } if *value == ContentMode::TWO => {
                 self.state.playing = true;
-                self.player.resume();
-                self.save();
+                if self.live.active {
+                    self.player.pause();
+                    self.live.dirty = self.live.has_frame;
+                    self.live.next = Instant::now();
+                } else {
+                    self.player.resume();
+                }
             }
-            PanelCommand::Time { format } => {
-                self.state.time_format = *format;
-                self.save();
-            }
-            PanelCommand::Brightness { value } => {
-                self.state.brightness = Some(*value);
-                self.save();
-            }
-            PanelCommand::Speed { .. }
-            | PanelCommand::Boot { .. }
+            PanelCommand::Mode { .. } => self.stop_streaming(),
+            PanelCommand::Time { format } => self.state.time_format = *format,
+            PanelCommand::Brightness { value } => self.state.brightness = Some(*value),
+            PanelCommand::Speed { value } => self.state.speed = Some(*value),
+            PanelCommand::Boot { .. }
             | PanelCommand::Sweep { .. }
             | PanelCommand::Battery { .. }
             | PanelCommand::State => {}
         }
-
-        // Reflect the new streaming state immediately, even if the panel
-        // command itself takes a while.
+        self.save();
         self.update_preview();
 
-        match self.panel_apply(&command) {
-            Ok(_) => {
-                if matches!(
-                    command,
-                    PanelCommand::Mode {
-                        value: ContentMode::Two
-                    }
-                ) {
-                    match self.begin_streaming() {
-                        Ok(()) => Reply::ok(),
-                        Err(message) => Reply::error(message),
-                    }
-                } else {
-                    Reply::ok()
-                }
+        if matches!(
+            command,
+            PanelCommand::Mode {
+                value: ContentMode::TWO
             }
+        ) {
+            return match self.begin_streaming() {
+                Ok(()) => Reply::ok(),
+                Err(message) => Reply::error(message),
+            };
+        }
+
+        if self.panel.is_none() {
+            return Reply::ok();
+        }
+
+        match self.panel_apply(&command) {
+            Ok(_) => Reply::ok(),
             Err(message) => Reply::error(message),
         }
+    }
+
+    fn stop_streaming(&mut self) {
+        self.state.playing = false;
+        self.player.pause();
+        self.live.dirty = false;
     }
 
     fn begin_streaming(&mut self) -> Result<(), String> {
@@ -405,7 +584,7 @@ impl App {
             return Ok(());
         }
         self.panel_apply(&PanelCommand::Mode {
-            value: ContentMode::Two,
+            value: ContentMode::TWO,
         })?;
         self.panel_apply(&PanelCommand::Sweep { value: false })?;
         Ok(())
@@ -427,23 +606,39 @@ impl App {
         }
     }
 
+    fn sync_time(&mut self) {
+        self.next_time_sync = Instant::now() + TIME_SYNC_PERIOD;
+        if let Err(message) = self.panel_apply(&PanelCommand::Time {
+            format: self.state.time_format,
+        }) {
+            eprintln!("warning: clock sync failed: {message}");
+        }
+    }
+
     fn panel_failed(&mut self, error: io::Error) {
+        if self.panel.is_none() {
+            return;
+        }
         eprintln!("panel lost: {error}; waiting for reconnect");
         self.panel = None;
         self.device_id = None;
-        self.live = false;
-        self.live_has_frame = false;
+        self.next_retry = Instant::now() + self.reconnect_period;
+        self.live.dirty = false;
         self.update_preview();
     }
 
     /// The preview mirrors host frames only while the panel is connected and
     /// actually receiving them.
     fn update_preview(&self) {
-        self.preview
-            .set_streaming(self.state.playing && self.panel.is_some());
+        if let Some(preview) = &self.preview {
+            preview.set_streaming(self.state.playing && self.panel.is_some());
+        }
     }
 
     fn save(&self) {
+        if !self.persist {
+            return;
+        }
         if let Err(error) = self.state.save() {
             eprintln!("warning: could not save state: {error}");
         }
@@ -452,17 +647,22 @@ impl App {
     fn shutdown(&mut self) {
         // Only replace host frames. A theme, clock, or powered-off panel is
         // already a built-in display and should be left alone.
-        if self.state.playing
-            && let Some(panel) = self.panel.as_mut()
-            && let Err(error) = panel.apply(&BUILTIN_DISPLAY)
-        {
-            eprintln!("warning: could not restore built-in mode: {error}");
+        if self.state.playing {
+            if let Some(panel) = self.panel.as_mut() {
+                if let Err(error) = panel.apply(&BUILTIN_DISPLAY) {
+                    eprintln!("warning: could not restore built-in mode: {error}");
+                }
+            }
         }
 
         let _ = std::fs::remove_file(&self.paths.control);
         let _ = std::fs::remove_file(&self.paths.frames);
         let _ = std::fs::remove_file(&self.paths.preview);
     }
+}
+
+fn period(fps: Fps) -> Duration {
+    Duration::from_secs_f64(1.0 / f64::from(fps.get()))
 }
 
 /// Install a SIGINT/SIGTERM flag shared by the foreground loops.
@@ -477,8 +677,8 @@ pub fn stop_flag() -> io::Result<Arc<AtomicBool>> {
 }
 
 /// Run a native animation in the foreground (used by `anim` without a daemon
-/// and by `preview` when no daemon is running). The shared [`Player`] keeps
-/// this loop as small as the daemon's, and a signal restores the built-in mode.
+/// and by `preview` when no daemon is running). A signal restores the built-in
+/// display.
 ///
 /// # Errors
 /// Propagates panel failures.
@@ -487,7 +687,7 @@ pub fn run_animation(panel: &mut dyn Panel, mut player: Player) -> io::Result<()
 
     let result = (|| {
         panel.apply(&PanelCommand::Mode {
-            value: ContentMode::Two,
+            value: ContentMode::TWO,
         })?;
         panel.apply(&PanelCommand::Sweep { value: false })?;
         player.resume();
@@ -509,4 +709,221 @@ pub fn run_animation(panel: &mut dyn Panel, mut player: Player) -> io::Result<()
 
     let _ = panel.apply(&BUILTIN_DISPLAY);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::animation::starfield;
+    use crate::canvas::GRAYSCALE_BYTES;
+    use crate::protocol::{Theme, TimeFormat};
+
+    #[derive(Default)]
+    struct FakeData {
+        commands: Vec<PanelCommand>,
+        frames: Vec<Vec<u8>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakePanel(Arc<Mutex<FakeData>>);
+
+    impl FakePanel {
+        fn frames(&self) -> usize {
+            self.0.lock().unwrap().frames.len()
+        }
+
+        fn last_frame(&self) -> Vec<u8> {
+            self.0.lock().unwrap().frames.last().unwrap().clone()
+        }
+
+        fn commands(&self) -> Vec<PanelCommand> {
+            self.0.lock().unwrap().commands.clone()
+        }
+    }
+
+    impl Panel for FakePanel {
+        fn apply(&mut self, command: &PanelCommand) -> io::Result<Option<String>> {
+            self.0.lock().unwrap().commands.push(command.clone());
+            Ok(None)
+        }
+
+        fn frame(&mut self, canvas: &Canvas) -> io::Result<()> {
+            self.0.lock().unwrap().frames.push(canvas.pixels().to_vec());
+            Ok(())
+        }
+    }
+
+    type TestOpen = Box<dyn FnMut() -> io::Result<Box<dyn Panel>>>;
+    type PanelSlot = Arc<Mutex<Option<FakePanel>>>;
+    type TestParts = (App<TestOpen>, SyncSender<Vec<u8>>, PanelSlot);
+
+    fn test_app(state: State, panel: Option<FakePanel>) -> TestParts {
+        let (frame_tx, frame_rx) = mpsc::sync_channel(1);
+        // Capacity for all frames a single test displays; nothing drains it.
+        let (spare_tx, spare_rx) = mpsc::sync_channel(16);
+        std::mem::forget(spare_rx);
+
+        let slot = Arc::new(Mutex::new(panel));
+        let open_slot = Arc::clone(&slot);
+        let open: TestOpen = Box::new(move || match open_slot.lock().unwrap().clone() {
+            Some(panel) => Ok(Box::new(panel) as Box<dyn Panel>),
+            None => Err(io::Error::new(io::ErrorKind::NotFound, "no panel")),
+        });
+
+        let player = Player::new(state.animation.clone(), state.fps);
+        let paths = Paths {
+            control: PathBuf::from("/nonexistent/zenvision-control"),
+            frames: PathBuf::from("/nonexistent/zenvision-frames"),
+            preview: PathBuf::from("/nonexistent/zenvision-preview"),
+        };
+        let mut app = App::new(
+            paths,
+            state,
+            player,
+            open,
+            FrameIo {
+                rx: frame_rx,
+                spare: spare_tx,
+            },
+            None,
+            Duration::from_millis(20),
+        );
+        app.persist = false;
+        (app, frame_tx, slot)
+    }
+
+    fn playing_state() -> State {
+        State {
+            animation: AnimationKind::Starfield(starfield::Options::default()),
+            playing: true,
+            ..State::default()
+        }
+    }
+
+    #[test]
+    fn reconnect_deadline_does_not_move() {
+        let (mut app, _frame_tx, _slot) = test_app(State::default(), None);
+        app.try_open(); // fails and schedules the retry
+
+        let first = app.deadline().unwrap();
+        thread::sleep(Duration::from_millis(5));
+        let second = app.deadline().unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn offline_theme_is_recorded_and_replayed_on_connect() {
+        let (mut app, _frame_tx, slot) = test_app(State::default(), None);
+        app.try_open();
+
+        let theme = Theme::new(3).unwrap();
+        let reply = app.apply(Command::Panel(PanelCommand::Theme { value: theme }));
+        assert!(matches!(reply, Reply::Ok { .. }));
+        assert_eq!(app.state.theme, Some(theme));
+        assert!(!app.state.playing);
+
+        let panel = FakePanel::default();
+        *slot.lock().unwrap() = Some(panel.clone());
+        app.try_open();
+
+        assert!(
+            panel
+                .commands()
+                .iter()
+                .any(|command| matches!(command, PanelCommand::Theme { value } if *value == theme))
+        );
+    }
+
+    #[test]
+    fn offline_momentary_command_is_rejected() {
+        let (mut app, _frame_tx, _slot) = test_app(State::default(), None);
+        app.try_open();
+
+        let reply = app.apply(Command::Panel(PanelCommand::Boot { value: true }));
+        assert!(matches!(reply, Reply::Error { .. }));
+    }
+
+    #[test]
+    fn live_frames_wait_for_the_loop_deadline() {
+        let panel = FakePanel::default();
+        let (mut app, frame_tx, _slot) = test_app(playing_state(), Some(panel.clone()));
+        app.try_open();
+        assert_eq!(panel.frames(), 0);
+
+        frame_tx.send(vec![7u8; GRAYSCALE_BYTES]).unwrap();
+        app.handle(Event::FrameReady);
+        assert_eq!(panel.frames(), 0);
+
+        app.live.next = Instant::now();
+        app.on_deadline();
+        assert_eq!(panel.frames(), 1);
+        assert!(panel.last_frame().iter().all(|&pixel| pixel == 7));
+
+        frame_tx.send(vec![9u8; GRAYSCALE_BYTES]).unwrap();
+        app.handle(Event::FrameReady);
+        assert_eq!(panel.frames(), 1);
+
+        app.live.next = Instant::now();
+        app.on_deadline();
+        assert_eq!(panel.frames(), 2);
+        assert!(panel.last_frame().iter().all(|&pixel| pixel == 9));
+    }
+
+    #[test]
+    fn live_frame_is_resent_after_reconnect() {
+        let panel = FakePanel::default();
+        let (mut app, frame_tx, _slot) = test_app(playing_state(), Some(panel.clone()));
+        app.try_open();
+
+        frame_tx.send(vec![42u8; GRAYSCALE_BYTES]).unwrap();
+        app.handle(Event::FrameReady);
+        app.live.next = Instant::now();
+        app.on_deadline();
+        assert_eq!(panel.frames(), 1);
+
+        app.panel_failed(io::Error::other("unplugged"));
+        app.try_open();
+        app.on_deadline();
+
+        assert_eq!(panel.frames(), 2);
+        assert!(panel.last_frame().iter().all(|&pixel| pixel == 42));
+    }
+
+    #[test]
+    fn idle_loop_syncs_the_clock_hourly() {
+        let panel = FakePanel::default();
+        let (mut app, _frame_tx, _slot) = test_app(State::default(), Some(panel.clone()));
+        app.try_open();
+
+        app.next_time_sync = Instant::now();
+        app.on_deadline();
+
+        assert!(panel.commands().iter().any(|command| matches!(
+            command,
+            PanelCommand::Time {
+                format: TimeFormat::H24
+            }
+        )));
+        assert!(app.next_time_sync > Instant::now());
+    }
+
+    #[test]
+    fn shutdown_restores_the_builtin_clock_only_while_streaming() {
+        let panel = FakePanel::default();
+        let (mut app, _frame_tx, _slot) = test_app(playing_state(), Some(panel.clone()));
+        app.try_open();
+        app.shutdown();
+
+        assert!(panel.commands().contains(&BUILTIN_DISPLAY));
+
+        let panel = FakePanel::default();
+        let (mut app, _frame_tx, _slot) = test_app(State::default(), Some(panel.clone()));
+        app.try_open();
+        app.shutdown();
+
+        assert!(!panel.commands().contains(&BUILTIN_DISPLAY));
+    }
 }

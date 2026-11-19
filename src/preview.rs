@@ -1,157 +1,205 @@
 //! Live preview fan-out.
 //!
-//! The daemon publishes exactly the frames it sends to the panel. A preview
-//! client connects to a dedicated socket and receives those frames, plus a
-//! short status message when streaming starts or stops.
+//! The daemon keeps the newest frame the panel actually accepted. Preview
+//! clients poll that shared slot, so any number of them can watch, a slow
+//! client only skips frames, and no client can slow down the panel.
 //!
-//! Publication is skipped entirely when no preview client is connected, and the
-//! frame channel holds at most one frame, so a slow preview can never slow down
-//! the panel.
+//! Each seqpacket message is one byte of tag plus its payload: `0` is a raw
+//! frame, `1` means streaming started, `2` means it stopped.
 
 use std::io::{self, Read, Write};
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use socket2::Socket;
 
 use crate::canvas::{Canvas, GRAYSCALE_BYTES};
 use crate::panel::{Panel, TerminalPanel};
 
-const STATUS_STREAMING: &[u8] = b"streaming";
-const STATUS_STOPPED: &[u8] = b"stopped";
+const TAG_FRAME: u8 = 0;
+const TAG_STREAMING: u8 = 1;
+const TAG_STOPPED: u8 = 2;
 
-const STATUS_INTERVAL: Duration = Duration::from_millis(50);
+const POLL: Duration = Duration::from_millis(16);
+const STATUS_INTERVAL: Duration = Duration::from_secs(1);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
+struct Shared {
+    latest: Mutex<Option<(u64, Vec<u8>)>>,
+    seq: AtomicU64,
+    streaming: AtomicBool,
+    clients: AtomicUsize,
+}
 
 /// Publisher side, owned by the daemon and shared with the panel tee.
 #[derive(Clone)]
-pub struct PreviewHub {
-    active: Arc<AtomicBool>,
-    streaming: Arc<AtomicBool>,
-    frames: SyncSender<Vec<u8>>,
-}
+pub struct PreviewHub(Arc<Shared>);
 
 impl PreviewHub {
     /// Start the preview listener thread.
     pub fn spawn(listener: Socket) -> Self {
-        let (frames, receiver) = mpsc::sync_channel(1);
-        let active = Arc::new(AtomicBool::new(false));
-        let streaming = Arc::new(AtomicBool::new(false));
+        let hub = Self(Arc::new(Shared {
+            latest: Mutex::new(None),
+            seq: AtomicU64::new(0),
+            streaming: AtomicBool::new(false),
+            clients: AtomicUsize::new(0),
+        }));
 
-        let thread_active = Arc::clone(&active);
-        let thread_streaming = Arc::clone(&streaming);
+        let shared = Arc::clone(&hub.0);
         if let Err(error) = thread::Builder::new()
             .name("zenvision-preview".into())
-            .spawn(move || serve(listener, receiver, thread_active, thread_streaming))
+            .spawn(move || serve(listener, shared))
         {
             eprintln!("warning: could not start preview thread: {error}");
         }
 
-        Self {
-            active,
-            streaming,
-            frames,
-        }
+        hub
     }
 
-    /// Publish one frame that the panel actually accepted.
+    /// Publish one frame that the panel accepted. Does nothing without viewers.
     pub fn publish(&self, canvas: &Canvas) {
-        if !self.active.load(Ordering::Relaxed) || !self.streaming.load(Ordering::Relaxed) {
+        if self.0.clients.load(Ordering::Relaxed) == 0 || !self.0.streaming.load(Ordering::Relaxed)
+        {
             return;
         }
-        let _ = self.frames.try_send(canvas.pixels().to_vec());
+
+        let seq = self.0.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Ok(mut latest) = self.0.latest.lock() {
+            *latest = Some((seq, canvas.pixels().to_vec()));
+        }
     }
 
     /// Tell preview clients whether the panel is receiving host frames.
     pub fn set_streaming(&self, streaming: bool) {
-        self.streaming.store(streaming, Ordering::Relaxed);
+        self.0.streaming.store(streaming, Ordering::Relaxed);
     }
 }
 
-fn serve(
-    listener: Socket,
-    frames: Receiver<Vec<u8>>,
-    active: Arc<AtomicBool>,
-    streaming: Arc<AtomicBool>,
-) {
+fn serve(listener: Socket, shared: Arc<Shared>) {
     loop {
         match listener.accept() {
             Ok((socket, _)) => {
-                let Ok(mut stream) = socket_into_stream(socket) else {
+                let Ok(stream) = socket_into_stream(socket) else {
                     continue;
                 };
-                let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
-                active.store(true, Ordering::Relaxed);
-                let _ = serve_client(&mut stream, &frames, &streaming);
-                active.store(false, Ordering::Relaxed);
+                let shared = Arc::clone(&shared);
+                let _ = thread::Builder::new()
+                    .name("zenvision-preview-client".into())
+                    .spawn(move || {
+                        shared.clients.fetch_add(1, Ordering::Relaxed);
+                        let _ = serve_client(stream, &shared);
+                        shared.clients.fetch_sub(1, Ordering::Relaxed);
+                    });
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => {
                 eprintln!("preview socket accept failed: {error}");
-                return;
+                thread::sleep(Duration::from_millis(100));
             }
         }
     }
 }
 
-fn serve_client(
-    stream: &mut UnixStream,
-    frames: &Receiver<Vec<u8>>,
-    streaming: &AtomicBool,
-) -> io::Result<()> {
-    let mut last_streaming = streaming.load(Ordering::Relaxed);
-    write_status(stream, last_streaming)?;
+fn serve_client(mut stream: UnixStream, shared: &Shared) -> io::Result<()> {
+    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
 
-    // Drop anything queued before this client connected, but keep the newest
-    // frame so a streaming preview starts with a picture immediately.
-    let mut latest = None;
-    while let Ok(frame) = frames.try_recv() {
-        latest = Some(frame);
-    }
-    if last_streaming && let Some(frame) = latest {
-        stream.write_all(&frame)?;
-    }
+    let mut last_seq = 0u64;
+    let mut last_streaming = None;
+    let mut last_status: Option<Instant> = None;
+    let mut packet = Vec::with_capacity(GRAYSCALE_BYTES + 1);
 
     loop {
-        match frames.recv_timeout(STATUS_INTERVAL) {
-            Ok(frame) => {
-                let now = streaming.load(Ordering::Relaxed);
-                if now != last_streaming {
-                    write_status(stream, now)?;
-                    last_streaming = now;
-                }
-                if now {
-                    stream.write_all(&frame)?;
-                }
-            }
-            Err(RecvTimeoutError::Timeout) => {
-                let now = streaming.load(Ordering::Relaxed);
-                // Repeating the current status also detects a client that
-                // disconnected while the panel was stopped.
-                write_status(stream, now)?;
-                last_streaming = now;
-            }
-            Err(RecvTimeoutError::Disconnected) => return Ok(()),
-        }
-    }
-}
+        let streaming = shared.streaming.load(Ordering::Relaxed);
+        let now = Instant::now();
+        let status_due = last_status.is_none_or(|sent| now.duration_since(sent) >= STATUS_INTERVAL);
 
-fn write_status(stream: &mut UnixStream, streaming: bool) -> io::Result<()> {
-    stream.write_all(if streaming {
-        STATUS_STREAMING
-    } else {
-        STATUS_STOPPED
-    })
+        // Repeating the status once a second detects a client that went away
+        // while the panel was stopped.
+        if last_streaming != Some(streaming) || status_due {
+            stream.write_all(&[if streaming {
+                TAG_STREAMING
+            } else {
+                TAG_STOPPED
+            }])?;
+            last_streaming = Some(streaming);
+            last_status = Some(now);
+        }
+
+        let frame = if streaming {
+            let latest = shared
+                .latest
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match latest.as_ref() {
+                Some((seq, frame)) if *seq != last_seq => {
+                    last_seq = *seq;
+                    Some(frame.clone())
+                }
+                _ => None,
+            }
+        } else {
+            // Do not replay an old frame when streaming resumes.
+            if let Ok(latest) = shared.latest.lock() {
+                if let Some((seq, _)) = latest.as_ref() {
+                    last_seq = *seq;
+                }
+            }
+            None
+        };
+
+        if let Some(frame) = frame {
+            packet.clear();
+            packet.push(TAG_FRAME);
+            packet.extend_from_slice(&frame);
+            stream.write_all(&packet)?;
+        }
+
+        thread::sleep(POLL);
+    }
 }
 
 fn socket_into_stream(socket: Socket) -> io::Result<UnixStream> {
     let owned = socket.as_fd().try_clone_to_owned()?;
     Ok(UnixStream::from(owned))
+}
+
+/// Client side: write raw frames to stdout for an external viewer.
+///
+/// # Errors
+/// Propagates stdin/stdout failures.
+pub fn follow_raw(mut stream: UnixStream) -> io::Result<()> {
+    let stop = crate::app::stop_flag()?;
+    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
+
+    let mut frame = vec![0u8; GRAYSCALE_BYTES + 1];
+    let mut stdout = io::stdout().lock();
+
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        match stream.read(&mut frame) {
+            Ok(0) => return Ok(()),
+            Ok(size) if frame[0] == TAG_FRAME && size == GRAYSCALE_BYTES + 1 => {
+                stdout.write_all(&frame[1..])?;
+                stdout.flush()?;
+            }
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) => {}
+            Err(_) => return Ok(()),
+        }
+    }
 }
 
 /// Client side: mirror daemon frames in the terminal until EOF or Ctrl-C.
@@ -160,11 +208,11 @@ fn socket_into_stream(socket: Socket) -> io::Result<UnixStream> {
 /// Propagates terminal writes and canvas conversion failures.
 pub fn follow(mut stream: UnixStream, terminal: &mut TerminalPanel) -> io::Result<()> {
     let stop = crate::app::stop_flag()?;
-    stream.set_read_timeout(Some(STATUS_INTERVAL))?;
+    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
 
     let mut canvas = Canvas::new();
-    let mut frame = vec![0u8; GRAYSCALE_BYTES];
-    let mut last_streaming = None;
+    let mut frame = vec![0u8; GRAYSCALE_BYTES + 1];
+    let mut streaming = None;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -172,29 +220,19 @@ pub fn follow(mut stream: UnixStream, terminal: &mut TerminalPanel) -> io::Resul
         }
 
         match stream.read(&mut frame) {
-            Ok(GRAYSCALE_BYTES) => {
-                canvas.set_grayscale(&frame)?;
-                terminal.frame(&canvas)?;
-            }
             Ok(0) => return Ok(()),
-            Ok(size) => {
-                let status = &frame[..size];
-                let streaming = if status == STATUS_STREAMING {
-                    true
-                } else if status == STATUS_STOPPED {
-                    false
-                } else {
-                    continue;
-                };
-
-                if last_streaming != Some(streaming) {
-                    if !streaming {
-                        terminal
-                            .notice("panel is not streaming (built-in display or disconnected)")?;
-                    }
-                    last_streaming = Some(streaming);
+            Ok(size) => match frame[0] {
+                TAG_FRAME if size == GRAYSCALE_BYTES + 1 => {
+                    canvas.set_grayscale(&frame[1..])?;
+                    terminal.frame(&canvas)?;
                 }
-            }
+                TAG_STREAMING => streaming = Some(true),
+                TAG_STOPPED if streaming != Some(false) => {
+                    terminal.notice("panel is not streaming (built-in display or disconnected)")?;
+                    streaming = Some(false);
+                }
+                _ => {}
+            },
             Err(error)
                 if matches!(
                     error.kind(),

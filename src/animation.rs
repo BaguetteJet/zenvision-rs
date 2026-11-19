@@ -2,6 +2,11 @@
 //!
 //! Rust owns the clock: an animation is asked to draw one frame for an elapsed
 //! duration, and may report that it is unchanged, finished, or failed.
+//!
+//! Adding an animation means creating `animation/<name>.rs` with an `Options`
+//! type (serde + `clap::Args`) and a `<Name>::new(Options)` constructor, then
+//! adding one line to [`animations!`]. That line is the serde tag, the clap
+//! subcommand, the factory and the display name at once.
 
 use std::io;
 use std::time::Duration;
@@ -10,8 +15,6 @@ use clap::Subcommand;
 use serde::{Deserialize, Serialize};
 
 use crate::canvas::Canvas;
-
-pub mod starfield;
 
 /// What an animation produced for the current tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,31 +44,51 @@ pub trait Animation {
     }
 }
 
-/// The closed set of built-in animations.
-///
-/// One variant is the whole registration: serde names it in the state file and
-/// IPC, `clap` exposes it as a subcommand, and the animation owns its tuning
-/// through its `Options` type (which derives [`clap::Args`]).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Subcommand)]
-#[serde(rename_all = "snake_case")]
-#[command(rename_all = "snake_case")]
-pub enum AnimationKind {
-    /// Warp-speed starfield
-    Starfield(starfield::Options),
+macro_rules! animations {
+    ($(
+        $(#[$meta:meta])*
+        $module:ident => $variant:ident
+    ),+ $(,)?) => {
+        $(
+            pub mod $module;
+        )+
+
+        /// The closed set of built-in animations.
+        ///
+        /// Each variant is a serde tag, a clap subcommand and a factory entry.
+        #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Subcommand)]
+        #[serde(rename_all = "snake_case")]
+        #[command(rename_all = "snake_case")]
+        pub enum AnimationKind {
+            $(
+                $(#[$meta])*
+                $variant($module::Options),
+            )+
+        }
+
+        impl AnimationKind {
+            pub fn create(&self) -> Box<dyn Animation> {
+                match self {
+                    $(
+                        Self::$variant(options) => {
+                            Box::new($module::$variant::new(*options))
+                        }
+                    )+
+                }
+            }
+
+            pub const fn name(&self) -> &'static str {
+                match self {
+                    $(Self::$variant(_) => stringify!($module),)+
+                }
+            }
+        }
+    };
 }
 
-impl AnimationKind {
-    pub fn create(&self) -> Box<dyn Animation> {
-        match self {
-            Self::Starfield(options) => Box::new(starfield::Starfield::new(*options)),
-        }
-    }
-
-    pub const fn name(&self) -> &'static str {
-        match self {
-            Self::Starfield(_) => "starfield",
-        }
-    }
+animations! {
+    /// Warp-speed starfield
+    starfield => Starfield,
 }
 
 impl Default for AnimationKind {

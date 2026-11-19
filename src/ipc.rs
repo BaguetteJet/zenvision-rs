@@ -1,14 +1,15 @@
 //! Unix-socket IPC and the external frame transport.
 //!
 //! The control socket speaks one versioned JSON request and one JSON reply per
-//! connection. The frame socket is `SOCK_SEQPACKET`: each message is exactly
-//! one raw grayscale frame. External producers never execute commands; they
-//! only supply pixels, and disconnecting releases the display.
+//! connection. The frame socket is `SOCK_SEQPACKET`: each message starts with a
+//! tag byte, `0` for a raw frame and `1` for animation input. External producers
+//! never execute commands; they only supply pixels, and disconnecting releases
+//! the display.
 
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::AsFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
@@ -29,6 +30,20 @@ pub const PROTOCOL_VERSION: u32 = 1;
 const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const MAX_REPLY_BYTES: u64 = 64 * 1024;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A producer that is silent for this long is disconnected so the built-in
+/// animation can take over and another producer can connect.
+const PRODUCER_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// First byte of a seqpacket frame-socket message.
+pub const TAG_FRAME: u8 = 0;
+/// First byte of a seqpacket animation-input message.
+pub const TAG_INPUT: u8 = 1;
+
+const FRAME_MESSAGE_BYTES: usize = GRAYSCALE_BYTES + 1;
+/// One byte of slack lets `read` distinguish an oversized datagram from a
+/// valid one; SOCK_SEQPACKET truncates anything larger.
+const RECEIVE_BYTES: usize = FRAME_MESSAGE_BYTES + 1;
 
 /// One control-socket request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -110,21 +125,35 @@ impl Paths {
 }
 
 fn runtime_dir() -> io::Result<PathBuf> {
-    if let Some(directory) = std::env::var_os("XDG_RUNTIME_DIR") {
-        let directory = PathBuf::from(directory);
-        private_dir(&directory)?;
-        return Ok(directory);
+    if let Some(directory) = std::env::var_os("XDG_RUNTIME_DIR").filter(|value| !value.is_empty()) {
+        // The user's runtime directory is already private and owned by them;
+        // never create or chmod it.
+        return Ok(PathBuf::from(directory));
     }
 
     // SAFETY: `geteuid` has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
     let directory = std::env::temp_dir().join(format!("zenvision-{uid}"));
-    private_dir(&directory)?;
+    private_dir(&directory, uid)?;
     Ok(directory)
 }
 
-fn private_dir(path: &Path) -> io::Result<()> {
+/// Create the fallback directory and make sure it is ours and private.
+fn private_dir(path: &Path, uid: libc::uid_t) -> io::Result<()> {
     fs::create_dir_all(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", path.display()),
+        ));
+    }
+    if metadata.uid() != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is not owned by uid {uid}", path.display()),
+        ));
+    }
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
@@ -168,7 +197,7 @@ pub struct Server {
 
 impl Server {
     /// Accept control connections on their own lightweight threads, and serve
-    /// at most one frame producer at a time.
+    /// one frame producer at a time.
     ///
     /// A stalled client only ties up its own thread: reads have a timeout and a
     /// length cap, so the frame loop is never blocked.
@@ -207,7 +236,7 @@ fn serve_control(listener: UnixListener, events: Sender<Event>) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => {
                 eprintln!("control socket accept failed: {error}");
-                return;
+                thread::sleep(Duration::from_millis(100));
             }
         }
     }
@@ -224,17 +253,6 @@ fn serve_client(stream: UnixStream, events: Sender<Event>) {
             return;
         }
     };
-
-    if request.version != PROTOCOL_VERSION {
-        let _ = write_reply(
-            &stream,
-            &Reply::error(format!(
-                "protocol version {} does not match daemon version {}; restart the daemon",
-                request.version, PROTOCOL_VERSION
-            )),
-        );
-        return;
-    }
 
     let (reply_tx, reply_rx) = mpsc::channel();
     if events
@@ -253,6 +271,12 @@ fn serve_client(stream: UnixStream, events: Sender<Event>) {
     let _ = write_reply(&stream, &reply);
 }
 
+/// The only field needed to decide whether the sender can be understood.
+#[derive(Deserialize)]
+struct Envelope {
+    version: u32,
+}
+
 fn read_request(stream: &UnixStream) -> Result<Request, String> {
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
@@ -267,6 +291,17 @@ fn read_request(stream: &UnixStream) -> Result<Request, String> {
     }
     if !line.ends_with('\n') {
         return Err("request is too large or incomplete".into());
+    }
+
+    // Check the envelope before the command: a newer client with a new
+    // command should hear about the version mismatch, not an unknown variant.
+    let envelope: Envelope =
+        serde_json::from_str(&line).map_err(|error| format!("invalid request: {error}"))?;
+    if envelope.version != PROTOCOL_VERSION {
+        return Err(format!(
+            "protocol version {} does not match daemon version {}; restart the daemon",
+            envelope.version, PROTOCOL_VERSION
+        ));
     }
 
     serde_json::from_str(&line).map_err(|error| format!("invalid request: {error}"))
@@ -298,7 +333,7 @@ fn serve_frames(
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => {
                 eprintln!("frame socket accept failed: {error}");
-                return;
+                thread::sleep(Duration::from_millis(100));
             }
         }
     }
@@ -310,27 +345,52 @@ fn read_frames(
     frame_tx: &SyncSender<Vec<u8>>,
     spare_rx: &Receiver<Vec<u8>>,
 ) {
-    let mut buffer = vec![0u8; GRAYSCALE_BYTES];
+    if stream
+        .set_read_timeout(Some(PRODUCER_IDLE_TIMEOUT))
+        .is_err()
+    {
+        return;
+    }
+
+    let mut buffer = vec![0u8; RECEIVE_BYTES];
     loop {
         match stream.read(&mut buffer) {
             Ok(0) => return,
-            Ok(GRAYSCALE_BYTES) => {
-                if frame_tx.send(buffer).is_err() || events.send(Event::FrameReady).is_err() {
+            Ok(size) if size > FRAME_MESSAGE_BYTES => {
+                // A truncated oversized datagram; drop it rather than treat it
+                // as a valid frame.
+            }
+            Ok(size) if size > 0 => {
+                if buffer[0] == TAG_FRAME && size == FRAME_MESSAGE_BYTES {
+                    buffer.copy_within(1..size, 0);
+                    buffer.truncate(GRAYSCALE_BYTES);
+                    if frame_tx.send(buffer).is_err() || events.send(Event::FrameReady).is_err() {
+                        return;
+                    }
+                    // Wait for the loop to hand the buffer back. The loop
+                    // displays at its own rate, so this paces the producer.
+                    buffer = spare_rx
+                        .recv()
+                        .unwrap_or_else(|_| vec![0u8; GRAYSCALE_BYTES]);
+                    buffer.resize(RECEIVE_BYTES, 0);
+                } else if buffer[0] == TAG_INPUT
+                    && size > 1
+                    && events.send(Event::Input(buffer[1..size].to_vec())).is_err()
+                {
                     return;
                 }
-                // Wait for the loop to hand the buffer back. This bounds the
-                // pipeline to one frame and lets the producer self-pace.
-                buffer = spare_rx
-                    .recv()
-                    .unwrap_or_else(|_| vec![0u8; GRAYSCALE_BYTES]);
             }
-            Ok(size) => {
-                // Short messages are animation input, not frames.
-                if events.send(Event::Input(buffer[..size].to_vec())).is_err() {
-                    return;
-                }
-            }
+            Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                // Idle producer: release the display and let the next client in.
+                return;
+            }
             Err(_) => return,
         }
     }
@@ -422,19 +482,21 @@ pub fn connect_preview(paths: &Paths) -> io::Result<Option<UnixStream>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{PanelCommand, Theme};
+    use crate::protocol::PanelCommand;
 
     #[test]
     fn request_round_trips_as_json() {
         let request = Request {
             version: PROTOCOL_VERSION,
-            command: Command::Panel(PanelCommand::Theme { value: Theme::Four }),
+            command: Command::Panel(PanelCommand::Theme {
+                value: crate::protocol::Theme::new(4).unwrap(),
+            }),
         };
         let encoded = serde_json::to_string(&request).unwrap();
         let decoded: Request = serde_json::from_str(&encoded).unwrap();
         assert!(matches!(
             decoded.command,
-            Command::Panel(PanelCommand::Theme { value: Theme::Four })
+            Command::Panel(PanelCommand::Theme { .. })
         ));
     }
 
@@ -448,6 +510,18 @@ mod tests {
     }
 
     #[test]
+    fn version_is_checked_before_the_command_shape() {
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client
+            .write_all(b"{\"version\":2,\"command\":{\"hologram\":{}}}\n")
+            .unwrap();
+
+        let error = read_request(&server).unwrap_err();
+        assert!(error.contains("protocol version 2"), "{error}");
+        assert!(!error.contains("hologram"), "{error}");
+    }
+
+    #[test]
     fn frame_messages_are_not_confused_with_input() {
         let (server, mut client) = Socket::pair(Domain::UNIX, Type::SEQPACKET, None).unwrap();
         let stream = socket_into_stream(server).unwrap();
@@ -458,19 +532,60 @@ mod tests {
         let reader = thread::spawn(move || read_frames(&stream, &events_tx, &frame_tx, &spare_rx));
 
         let frame = vec![7u8; GRAYSCALE_BYTES];
-        client.write_all(&frame).unwrap();
+        let mut message = vec![TAG_FRAME];
+        message.extend_from_slice(&frame);
+        client.write_all(&message).unwrap();
         assert!(matches!(events_rx.recv().unwrap(), Event::FrameReady));
         let received = frame_rx.recv().unwrap();
         assert_eq!(received.len(), GRAYSCALE_BYTES);
         spare_tx.send(received).unwrap();
 
-        client.write_all(b"hi").unwrap();
+        client.write_all(&[TAG_INPUT, b'h', b'i']).unwrap();
         match events_rx.recv().unwrap() {
             Event::Input(input) => assert_eq!(input, b"hi"),
-            _ => panic!("short message should be input"),
+            _ => panic!("input tag should be input"),
         }
 
         drop(client);
         reader.join().unwrap();
+    }
+
+    #[test]
+    fn oversized_frames_are_dropped() {
+        let (server, mut client) = Socket::pair(Domain::UNIX, Type::SEQPACKET, None).unwrap();
+        let stream = socket_into_stream(server).unwrap();
+
+        let (events_tx, events_rx) = mpsc::channel();
+        let (frame_tx, _frame_rx) = mpsc::sync_channel(1);
+        let (_spare_tx, spare_rx) = mpsc::sync_channel(1);
+        let reader = thread::spawn(move || read_frames(&stream, &events_tx, &frame_tx, &spare_rx));
+
+        client
+            .write_all(&vec![TAG_FRAME; FRAME_MESSAGE_BYTES + 1])
+            .unwrap();
+        assert!(events_rx.recv_timeout(Duration::from_millis(50)).is_err());
+
+        drop(client);
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn fallback_directory_is_private() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        let uid = unsafe { libc::geteuid() };
+        let path = std::env::temp_dir().join(format!(
+            "zenvision-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&path);
+
+        private_dir(&path, uid).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        fs::remove_dir_all(&path).unwrap();
     }
 }

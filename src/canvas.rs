@@ -111,7 +111,7 @@ impl Canvas {
     /// Returns [`io::ErrorKind::InvalidData`] unless `out` is a whole number of
     /// panel packets.
     pub fn encode(&self, out: &mut [u8]) -> io::Result<()> {
-        if !out.len().is_multiple_of(PACKET_BYTES) {
+        if out.len() % PACKET_BYTES != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("frame buffer must be a multiple of {PACKET_BYTES} bytes"),
@@ -119,17 +119,17 @@ impl Canvas {
         }
 
         let packets = out.len() / PACKET_BYTES;
-        for (page, packet) in out.as_chunks_mut::<PACKET_BYTES>().0.iter_mut().enumerate() {
+        for (page, packet) in out.chunks_exact_mut(PACKET_BYTES).enumerate() {
             packet[0] = page as u8;
             packet[1] = u8::from(page == packets - 1);
 
             let start = page * PIXELS_PER_PACKET;
             let end = (start + PIXELS_PER_PACKET).min(self.pixels.len());
             let src = &self.pixels[start..end];
-            let payload = packet[4..].as_chunks_mut::<4>().0;
+            let payload = packet[4..].chunks_exact_mut(4);
 
             // 8 pixels -> 4 bytes; the top nibble of each pixel is its 4bpp value.
-            for (px, quad) in src.as_chunks::<8>().0.iter().zip(payload) {
+            for (px, quad) in src.chunks_exact(8).zip(payload) {
                 quad[0] = (px[2] >> 4) | (px[3] & 0xf0);
                 quad[1] = (px[0] >> 4) | (px[1] & 0xf0);
                 quad[2] = (px[6] >> 4) | (px[7] & 0xf0);

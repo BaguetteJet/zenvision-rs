@@ -15,9 +15,98 @@ pub const MAX_PAYLOAD: usize = 512;
 /// `f1 03` - query content state: "01" clock, "02" theme, "07" image.
 pub const STATE_QUERY: &[u8] = &[0xf1, 0x03];
 
+/// A validated numeric panel value, serialized as a plain JSON number.
+macro_rules! bounded_u8 {
+    (
+        $(#[$meta:meta])*
+        $name:ident, $min:literal..=$max:literal, $label:literal
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(try_from = "u8", into = "u8")]
+        pub struct $name(u8);
+
+        impl $name {
+            /// Validate a value.
+            ///
+            /// # Errors
+            /// Returns a message when the value is outside the allowed range.
+            pub fn new(value: u8) -> Result<Self, String> {
+                if ($min..=$max).contains(&value) {
+                    Ok(Self(value))
+                } else {
+                    Err(format!(
+                        concat!($label, " must be between {} and {}"),
+                        $min, $max
+                    ))
+                }
+            }
+
+            pub const fn get(self) -> u8 {
+                self.0
+            }
+        }
+
+        impl TryFrom<u8> for $name {
+            type Error = String;
+
+            fn try_from(value: u8) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl From<$name> for u8 {
+            fn from(value: $name) -> Self {
+                value.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+    };
+}
+
+bounded_u8!(
+    /// A validated theme value (1-4).
+    Theme, 1..=4, "theme"
+);
+
+bounded_u8!(
+    /// A validated built-in animation speed (1-3).
+    Speed, 1..=3, "speed"
+);
+
+bounded_u8!(
+    /// A validated clock style (1-2).
+    ClockStyle, 1..=2, "clock"
+);
+
+bounded_u8!(
+    /// A validated content mode (1-3).
+    ContentMode, 1..=3, "mode"
+);
+
+impl Theme {
+    /// Theme 4 is what the panel's built-in "on" command selects.
+    pub const FOUR: Self = Self(4);
+}
+
+impl ClockStyle {
+    /// Style 1 is the plain built-in clock.
+    pub const ONE: Self = Self(1);
+}
+
+impl ContentMode {
+    /// Mode 2 displays host-supplied frames.
+    pub const TWO: Self = Self(2);
+}
+
 /// `30 05 01 01` - built-in clock display, used when releasing the panel.
 pub const BUILTIN_DISPLAY: PanelCommand = PanelCommand::Clock {
-    value: ClockStyle::One,
+    value: ClockStyle::ONE,
 };
 
 /// One command understood by the panel firmware.
@@ -75,12 +164,12 @@ impl PanelCommand {
 
 // 30 05 01 <clock> set clock display layout
 fn set_clock(clock: ClockStyle) -> Vec<u8> {
-    vec![0x30, 0x05, 0x01, clock.value()]
+    vec![0x30, 0x05, 0x01, clock.get()]
 }
 
 // 30 05 02 00 <theme> set built-in theme
 fn set_theme(theme: Theme) -> Vec<u8> {
-    vec![0x30, 0x05, 0x02, 0x00, theme.value()]
+    vec![0x30, 0x05, 0x02, 0x00, theme.get()]
 }
 
 // 30 05 04 00 00 00 <val> set battery icon
@@ -91,7 +180,7 @@ fn set_battery(battery: bool) -> Vec<u8> {
 
 // 30 06 05 00 00 00 00 <mode> set content mode
 fn set_content_mode(mode: ContentMode) -> Vec<u8> {
-    vec![0x30, 0x06, 0x05, 0x00, 0x00, 0x00, 0x00, mode.value()]
+    vec![0x30, 0x06, 0x05, 0x00, 0x00, 0x00, 0x00, mode.get()]
 }
 
 // 31 02 <a> <b> set screen sweep
@@ -108,7 +197,7 @@ fn set_boot_animation(on: bool) -> Vec<u8> {
 
 // 33 01 <speed> set animation speed
 fn set_speed(speed: Speed) -> Vec<u8> {
-    vec![0x33, 0x01, speed.value()]
+    vec![0x33, 0x01, speed.get()]
 }
 
 // 35 01 <brightness> set brightness
@@ -146,166 +235,6 @@ fn power_on() -> Vec<Vec<u8>> {
         vec![0x30, 0x05, 0x04, 0x00, 0x00, 0x00, 0x03], // battery on
         vec![0x30, 0x05, 0x02, 0x00, 0x04],             // theme 4
     ]
-}
-
-/// A validated theme value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Theme {
-    One,
-    Two,
-    Three,
-    Four,
-}
-
-impl Theme {
-    pub const fn value(self) -> u8 {
-        match self {
-            Self::One => 1,
-            Self::Two => 2,
-            Self::Three => 3,
-            Self::Four => 4,
-        }
-    }
-
-    pub const fn from_value(value: u8) -> Option<Self> {
-        match value {
-            1 => Some(Self::One),
-            2 => Some(Self::Two),
-            3 => Some(Self::Three),
-            4 => Some(Self::Four),
-            _ => None,
-        }
-    }
-}
-
-impl FromStr for Theme {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        value
-            .parse()
-            .ok()
-            .and_then(Self::from_value)
-            .ok_or_else(|| "theme must be a number from 1 to 4".into())
-    }
-}
-
-/// A validated built-in animation speed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Speed {
-    Slow,
-    Normal,
-    Fast,
-}
-
-impl Speed {
-    pub const fn value(self) -> u8 {
-        match self {
-            Self::Slow => 1,
-            Self::Normal => 2,
-            Self::Fast => 3,
-        }
-    }
-
-    pub const fn from_value(value: u8) -> Option<Self> {
-        match value {
-            1 => Some(Self::Slow),
-            2 => Some(Self::Normal),
-            3 => Some(Self::Fast),
-            _ => None,
-        }
-    }
-}
-
-impl FromStr for Speed {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        value
-            .parse()
-            .ok()
-            .and_then(Self::from_value)
-            .ok_or_else(|| "speed must be a number from 1 to 3".into())
-    }
-}
-
-/// A validated clock style.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ClockStyle {
-    One,
-    Two,
-}
-
-impl ClockStyle {
-    pub const fn value(self) -> u8 {
-        match self {
-            Self::One => 1,
-            Self::Two => 2,
-        }
-    }
-
-    pub const fn from_value(value: u8) -> Option<Self> {
-        match value {
-            1 => Some(Self::One),
-            2 => Some(Self::Two),
-            _ => None,
-        }
-    }
-}
-
-impl FromStr for ClockStyle {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        value
-            .parse()
-            .ok()
-            .and_then(Self::from_value)
-            .ok_or_else(|| "clock must be a number from 1 to 2".into())
-    }
-}
-
-/// A validated content mode.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ContentMode {
-    One,
-    Two,
-    Three,
-}
-
-impl ContentMode {
-    pub const fn value(self) -> u8 {
-        match self {
-            Self::One => 1,
-            Self::Two => 2,
-            Self::Three => 3,
-        }
-    }
-
-    pub const fn from_value(value: u8) -> Option<Self> {
-        match value {
-            1 => Some(Self::One),
-            2 => Some(Self::Two),
-            3 => Some(Self::Three),
-            _ => None,
-        }
-    }
-}
-
-impl FromStr for ContentMode {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        value
-            .parse()
-            .ok()
-            .and_then(Self::from_value)
-            .ok_or_else(|| "mode must be a number from 1 to 3".into())
-    }
 }
 
 /// Clock time format.
@@ -526,7 +455,7 @@ mod tests {
 
         assert_eq!(
             PanelCommand::Mode {
-                value: ContentMode::Two
+                value: ContentMode::TWO
             }
             .payloads(time()),
             vec![vec![0x30, 0x06, 0x05, 0x00, 0x00, 0x00, 0x00, 2]]
@@ -554,14 +483,13 @@ mod tests {
         assert!(SpeedMultiplier::new(f32::INFINITY).is_err());
         assert!(SpeedMultiplier::new(1.5).is_ok());
 
-        assert_eq!("2".parse::<Speed>(), Ok(Speed::Normal));
-        assert!("1.5".parse::<Speed>().is_err());
+        assert_eq!(Speed::new(2).unwrap().get(), 2);
+        assert!(Speed::new(0).is_err());
         assert_eq!("1.5".parse::<SpeedMultiplier>().unwrap().get(), 1.5);
-        assert!("1.5".parse::<Theme>().is_err());
 
-        assert_eq!(Theme::from_value(4), Some(Theme::Four));
-        assert_eq!(Theme::from_value(0), None);
-        assert_eq!(Speed::from_value(3), Some(Speed::Fast));
-        assert_eq!(ContentMode::from_value(4), None);
+        assert_eq!(Theme::new(4), Ok(Theme::FOUR));
+        assert!(Theme::new(0).is_err());
+        assert_eq!(Theme::FOUR.get(), 4);
+        assert!(ContentMode::new(4).is_err());
     }
 }
