@@ -129,16 +129,20 @@ impl Panel for TeePanel {
     }
 }
 
-/// One character covers a 2x1 pixel block: the upper half block paints the top
-/// pixel in the foreground color and the bottom pixel in the background color.
-const PREVIEW_ROWS: usize = HEIGHT / 2;
+/// One character covers a 2x3 pixel block, so the full panel is 128x22 cells.
+/// This is also the hard upper bound: a wider terminal must not upscale past
+/// the panel's own 256x64 resolution.
+const PREVIEW_COLS: usize = WIDTH / 2;
+const PREVIEW_ROWS: usize = HEIGHT.div_ceil(3);
 
 /// A hardware-free preview for developing animations.
 ///
-/// Runs in the terminal's alternate screen, so leaving `preview` restores what
-/// was on screen. A full-size preview is 256 columns by 32 rows; smaller
-/// terminals get a nearest-neighbour resample that preserves the panel's 4:1
-/// aspect ratio.
+/// The preview runs in the terminal's alternate screen, so leaving `preview`
+/// restores whatever was on screen before and leaves no characters behind.
+/// Each character covers a 2x3 pixel block, so 256x64 becomes 128 columns by
+/// 22 rows. Foreground and background are true grayscale ANSI colors; pixels
+/// above the block mean become the foreground shape and the rest become the
+/// background, which reproduces the mock display from `terminal-mock-display`.
 pub struct TerminalPanel {
     active: bool,
     out: String,
@@ -151,7 +155,7 @@ impl TerminalPanel {
     pub fn new() -> Self {
         Self {
             active: false,
-            out: String::with_capacity(WIDTH * PREVIEW_ROWS * 4),
+            out: String::with_capacity(PREVIEW_COLS * PREVIEW_ROWS * 12),
             last_frame: Vec::with_capacity(WIDTH * HEIGHT),
             has_frame: false,
             size: None,
@@ -159,6 +163,9 @@ impl TerminalPanel {
     }
 
     /// Replace the preview with a centred status line.
+    ///
+    /// Used when the panel switches to a theme or clock and stops receiving
+    /// host frames.
     ///
     /// # Errors
     /// Propagates terminal write failures.
@@ -203,7 +210,7 @@ impl Panel for TerminalPanel {
         let resized = self.size != Some(size);
         let pixels = canvas.pixels();
 
-        // Static frames should not rewrite the terminal every tick.
+        // Static animations should not rewrite the terminal every tick.
         if !resized && self.has_frame && self.last_frame.as_slice() == pixels {
             return Ok(());
         }
@@ -262,50 +269,163 @@ fn terminal_size() -> (usize, usize) {
         }
     }
 
-    (WIDTH, PREVIEW_ROWS)
+    (PREVIEW_COLS, PREVIEW_ROWS)
 }
 
-/// Paint the canvas with one `▀` per top/bottom pixel pair.
+/// Character for a 2x3 pixel block.
+///
+/// `pattern` has one bit per pixel: bit 0 top-left, bit 1 top-right, bit 2
+/// middle-left, bit 3 middle-right, bit 4 bottom-left, bit 5 bottom-right.
+/// The 60 sextant characters (U+1FB00..U+1FB3B) skip the patterns already
+/// covered by `▌` (21), `▐` (42) and `█` (63).
+fn sextant(pattern: u8) -> char {
+    match pattern {
+        0 => ' ',
+        21 => '▌',
+        42 => '▐',
+        63 => '█',
+        n => {
+            let offset = u32::from(n) - 1 - u32::from(n > 21) - u32::from(n > 42);
+            char::from_u32(0x1FB00 + offset).unwrap_or(' ')
+        }
+    }
+}
+fn push_rgb_fg(out: &mut String, fg: u8) {
+    let _ = write!(out, "\x1b[38;2;{fg};{fg};{fg}m");
+}
+
+fn push_rgb_bg(out: &mut String, bg: u8) {
+    let _ = write!(out, "\x1b[48;2;{bg};{bg};{bg}m");
+}
+
 fn render(canvas: &Canvas, out: &mut String, cols: usize, rows: usize) {
     let pixels = canvas.pixels();
+    let display_cols = cols.clamp(1, PREVIEW_COLS);
+    let display_rows = rows.clamp(1, PREVIEW_ROWS);
 
-    // A character is about twice as tall as it is wide, so 256x64 pixels map
-    // to 256x32 characters. Shrink both dimensions together to stay 4:1.
-    let max_cols = cols.clamp(1, WIDTH);
-    let max_rows = rows.clamp(1, PREVIEW_ROWS);
-    let display_cols = max_cols.min(max_rows * 8);
-    let display_rows = max_rows.min(display_cols / 8).max(1);
-    let exact = display_cols == WIDTH && display_rows == PREVIEW_ROWS;
+    // At full size each cell is the exact 2x3 pixel block from the mock
+    // display. Smaller terminals get a nearest-neighbour resample instead of
+    // wrapping or clipping the image.
+    let exact = display_cols == PREVIEW_COLS && display_rows == PREVIEW_ROWS;
+
+    let sample_xs: Vec<[usize; 2]> = if exact {
+        Vec::new()
+    } else {
+        (0..display_cols)
+            .map(|cx| {
+                [
+                    ((cx * 2) * WIDTH / (display_cols * 2)).min(WIDTH - 1),
+                    ((cx * 2 + 1) * WIDTH / (display_cols * 2)).min(WIDTH - 1),
+                ]
+            })
+            .collect()
+    };
 
     for cy in 0..display_rows {
         let mut last_fg: Option<u8> = None;
         let mut last_bg: Option<u8> = None;
+        let mut transparent = false;
+
+        // The panel is 64 pixels high, so the last sextant cell has only its
+        // top third on-screen. Do not paint a background for that cell.
+        let partial_row = exact && cy + 1 == PREVIEW_ROWS && HEIGHT % 3 != 0;
+
+        let sample_ys: Option<[usize; 3]> = if exact {
+            None
+        } else {
+            Some([
+                ((cy * 3) * HEIGHT / (display_rows * 3)).min(HEIGHT - 1),
+                ((cy * 3 + 1) * HEIGHT / (display_rows * 3)).min(HEIGHT - 1),
+                ((cy * 3 + 2) * HEIGHT / (display_rows * 3)).min(HEIGHT - 1),
+            ])
+        };
 
         for cx in 0..display_cols {
-            let (top, bottom) = if exact {
-                (
-                    pixels[(cy * 2) * WIDTH + cx],
-                    pixels[(cy * 2 + 1) * WIDTH + cx],
-                )
-            } else {
-                let px = cx * WIDTH / display_cols;
-                let top_y = (cy * 2) * HEIGHT / (display_rows * 2);
-                let bottom_y = (cy * 2 + 1) * HEIGHT / (display_rows * 2);
-                (
-                    pixels[top_y.min(HEIGHT - 1) * WIDTH + px],
-                    pixels[bottom_y.min(HEIGHT - 1) * WIDTH + px],
-                )
-            };
+            let mut block = [None; 6];
+            let mut sum = 0u32;
+            let mut count = 0u32;
 
-            if last_fg != Some(top) {
-                let _ = write!(out, "\x1b[38;2;{top};{top};{top}m");
-                last_fg = Some(top);
+            if let Some(ys) = sample_ys {
+                let xs = sample_xs[cx];
+                for (dy, &py) in ys.iter().enumerate() {
+                    let row_offset = py * WIDTH;
+                    for (dx, &px) in xs.iter().enumerate() {
+                        let pixel = pixels[row_offset + px];
+                        block[dy * 2 + dx] = Some(pixel);
+                        sum += u32::from(pixel);
+                        count += 1;
+                    }
+                }
+            } else {
+                for dy in 0..3usize {
+                    let py = cy * 3 + dy;
+                    if py >= HEIGHT {
+                        continue;
+                    }
+                    let row_offset = py * WIDTH;
+                    for dx in 0..2usize {
+                        let px = cx * 2 + dx;
+                        if px < WIDTH {
+                            let pixel = pixels[row_offset + px];
+                            block[dy * 2 + dx] = Some(pixel);
+                            sum += u32::from(pixel);
+                            count += 1;
+                        }
+                    }
+                }
             }
-            if last_bg != Some(bottom) {
-                let _ = write!(out, "\x1b[48;2;{bottom};{bottom};{bottom}m");
-                last_bg = Some(bottom);
+
+            let mean = sum / count.max(1);
+
+            let mut pattern = 0u8;
+            let mut fg_sum = 0u32;
+            let mut fg_count = 0u32;
+            let mut bg_sum = 0u32;
+            let mut bg_count = 0u32;
+            for (bit, pixel) in block.iter().enumerate() {
+                let Some(pixel) = *pixel else { continue };
+                let pixel = u32::from(pixel);
+                if pixel >= mean {
+                    pattern |= 1 << bit;
+                    fg_sum += pixel;
+                    fg_count += 1;
+                } else {
+                    bg_sum += pixel;
+                    bg_count += 1;
+                }
             }
-            out.push('▀');
+
+            // Only emit color changes. A starfield row is mostly the same
+            // black/transparent pair, which makes the output much smaller.
+            let fg = (fg_sum / fg_count.max(1)) as u8;
+            if last_fg != Some(fg) {
+                push_rgb_fg(out, fg);
+                last_fg = Some(fg);
+            }
+
+            let background = if partial_row {
+                None
+            } else {
+                bg_sum.checked_div(bg_count)
+            };
+            match background {
+                Some(bg) => {
+                    let bg = bg as u8;
+                    if transparent || last_bg != Some(bg) {
+                        push_rgb_bg(out, bg);
+                        last_bg = Some(bg);
+                        transparent = false;
+                    }
+                }
+                None => {
+                    if !transparent {
+                        out.push_str("\x1b[49m");
+                        transparent = true;
+                        last_bg = None;
+                    }
+                }
+            }
+            out.push(sextant(pattern));
         }
 
         // Reset colors, clear any remaining cells on this line, then advance.
@@ -318,47 +438,97 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preview_is_one_line_per_pixel_pair() {
-        let canvas = Canvas::new();
-        let mut text = String::new();
-        render(&canvas, &mut text, WIDTH, PREVIEW_ROWS + 5);
-
-        let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), PREVIEW_ROWS);
-        assert_eq!(lines[0].matches('▀').count(), WIDTH);
+    fn sextant_maps_known_patterns() {
+        assert_eq!(sextant(0), ' ');
+        assert_eq!(sextant(1), '\u{1FB00}');
+        assert_eq!(sextant(21), '▌');
+        assert_eq!(sextant(22), '\u{1FB14}');
+        assert_eq!(sextant(42), '▐');
+        assert_eq!(sextant(62), '\u{1FB3B}');
+        assert_eq!(sextant(63), '█');
     }
 
     #[test]
-    fn preview_maps_top_and_bottom_pixels_to_colors() {
+    fn preview_is_128_columns_by_22_rows() {
+        let canvas = Canvas::new();
+        let mut text = String::new();
+        render(&canvas, &mut text, PREVIEW_COLS, PREVIEW_ROWS);
+
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(PREVIEW_COLS, WIDTH / 2);
+        assert_eq!(lines.len(), 22);
+        assert_eq!(lines[0].matches('█').count(), 128);
+    }
+
+    #[test]
+    fn preview_never_grows_past_the_panel() {
+        let canvas = Canvas::new();
+        let mut text = String::new();
+        render(&canvas, &mut text, 1000, 100);
+
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), PREVIEW_ROWS);
+        assert_eq!(lines[0].matches('█').count(), PREVIEW_COLS);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.matches('█').count() <= WIDTH / 2)
+        );
+    }
+
+    #[test]
+    fn preview_maps_pixels_to_grayscale() {
         let mut canvas = Canvas::new();
         canvas.plot(0, 0, 255);
-        canvas.plot(0, 1, 128);
+        let mut text = String::new();
+        render(&canvas, &mut text, PREVIEW_COLS, PREVIEW_ROWS);
+
+        // The bright top-left pixel becomes the foreground of the first char.
+        assert!(text.starts_with("\x1b[38;2;255;255;255m"));
+    }
+
+    #[test]
+    fn last_partial_row_has_no_background() {
+        let mut canvas = Canvas::new();
+        for x in 0..WIDTH {
+            canvas.plot(
+                x as i32,
+                (HEIGHT - 1) as i32,
+                if x % 2 == 0 { 255 } else { 10 },
+            );
+        }
 
         let mut text = String::new();
-        render(&canvas, &mut text, WIDTH, PREVIEW_ROWS);
+        render(&canvas, &mut text, PREVIEW_COLS, PREVIEW_ROWS);
 
-        assert!(text.starts_with("\x1b[38;2;255;255;255m\x1b[48;2;128;128;128m▀"));
+        // The last cell has only its top third on-screen. Its background must
+        // stay transparent so it cannot paint the missing bottom two rows.
+        let last = text.lines().last().unwrap();
+        assert!(!last.contains("\x1b[48;2;"));
+        assert!(last.contains("\x1b[49m"));
     }
 
     #[test]
     fn preview_coalesces_repeated_colors() {
         let canvas = Canvas::new();
         let mut text = String::new();
-        render(&canvas, &mut text, WIDTH, PREVIEW_ROWS);
+        render(&canvas, &mut text, PREVIEW_COLS, PREVIEW_ROWS);
 
-        // A blank row needs one foreground and one background escape.
+        // One foreground and one transparent-background escape per row is
+        // enough for a blank frame; there is no need for 128 of each.
         assert!(text.matches("\x1b[38;2;").count() <= PREVIEW_ROWS);
-        assert!(text.matches("\x1b[48;2;").count() <= PREVIEW_ROWS);
+        assert!(text.matches("\x1b[49m").count() <= PREVIEW_ROWS);
     }
 
     #[test]
-    fn preview_fits_a_smaller_terminal_and_keeps_aspect() {
+    fn preview_fits_a_smaller_terminal() {
         let canvas = Canvas::new();
         let mut text = String::new();
-        render(&canvas, &mut text, 40, 20);
+        render(&canvas, &mut text, 10, 2);
 
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 5);
-        assert_eq!(lines[0].matches('▀').count(), 40);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].matches('█').count(), 10);
+        assert_eq!(lines[1].matches('█').count(), 10);
     }
 }

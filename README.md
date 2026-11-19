@@ -49,16 +49,16 @@ preview stops too and shows a status line. Without a daemon it renders the
 requested animation locally. Any number of preview clients can attach at once
 and they all read the same latest frame.
 
-The terminal view runs in the alternate screen using half-block characters
-with true grayscale colors, keeps the panel's 4:1 aspect ratio, scales to the
-terminal size, restores the previous screen on exit, and leaves no characters
-behind:
+The terminal view runs in the alternate screen using Unicode sextant blocks
+with true grayscale colors, shrinks to fit smaller terminals, never draws wider
+than the panel's 128 cells, restores the previous screen on exit, and leaves no
+characters behind:
 
 ```sh
 # with the daemon: mirror the panel
 zenvision preview
 
-# raw frames to stdout for ffplay, mpv, or another viewer
+# raw frames to stdout for ffplay or mpv; the final "-" means stdin
 zenvision preview --raw | ffplay -f rawvideo -pixel_format gray -video_size 256x64 -framerate 30 -
 
 # without a daemon: local animation preview
