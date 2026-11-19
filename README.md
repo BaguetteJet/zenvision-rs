@@ -28,16 +28,33 @@ zenvision speed 2
 zenvision time 24
 zenvision brightness 160
 zenvision state
-zenvision anim starfield --stars 90 --trail 66 --speed 1.5 --fps 30
+zenvision anim starfield --stars 40 --trail 40 --speed 1.5 --fps 30
 ```
 
 `anim` forwards to the daemon when one is running; without a daemon it drives
 the panel directly and restores the built-in clock on Ctrl-C.
 
-`preview` renders to the terminal, so animations can be developed without the
-panel:
+`theme` and `clock` are panel-owned displays: they pause the animation and
+hand the panel over to its built-in theme or clock. Host frames are not sent
+over them. Use `anim` (or `mode 2`) to resume streaming afterwards. Stopping
+the daemon while streaming restores the built-in clock instead of leaving the
+last frame on screen; an already-selected theme or clock is left alone.
+
+`preview` mirrors the actual frames the panel receives while the daemon is
+running, so `anim` option changes, live Python frames, and pauses for
+`theme`/`clock` show up immediately. When the panel stops streaming, the
+preview stops too and shows a status line. Without a daemon it renders the
+requested animation locally.
+
+It runs in the terminal's alternate screen as Unicode sextant blocks with true
+grayscale colors, scales to the terminal size, restores the previous screen on
+exit, and leaves no characters behind:
 
 ```sh
+# with the daemon: mirror the panel
+zenvision preview
+
+# without a daemon: local animation preview
 zenvision preview starfield --fps 15
 ```
 
@@ -118,6 +135,7 @@ panel.rs      Panel trait: RealPanel + TerminalPanel
 canvas.rs     grayscale canvas + 4bpp wire encoding
 animation.rs  Animation trait + built-in animation enum
 render.rs     Player: pacing, deadlines, frame timing
+preview.rs    live frame fan-out + terminal follower
 state.rs      persisted desired state
 ipc.rs        versioned JSON control socket + seqpacket frame socket
 event.rs      events consumed by the loop

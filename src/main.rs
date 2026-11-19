@@ -6,6 +6,7 @@ mod device;
 mod event;
 mod ipc;
 mod panel;
+mod preview;
 mod protocol;
 mod render;
 mod state;

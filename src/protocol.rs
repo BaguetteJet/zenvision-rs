@@ -11,41 +11,41 @@ use serde::{Deserialize, Serialize};
 /// Maximum command payload accepted by the panel.
 pub const MAX_PAYLOAD: usize = 512;
 
-/// Query the built-in engine state (`f1 03`).
+/// `f1 03` - query content state: "01" clock, "02" theme, "07" image.
 pub const STATE_QUERY: &[u8] = &[0xf1, 0x03];
 
-/// Built-in content mode that shows the clock. Used when releasing the panel.
-pub const BUILTIN_MODE: PanelCommand = PanelCommand::Mode {
-    value: ContentMode::One,
+/// `30 05 01 01` - built-in clock display, used when releasing the panel.
+pub const BUILTIN_DISPLAY: PanelCommand = PanelCommand::Clock {
+    value: ClockStyle::One,
 };
 
 /// One command understood by the panel firmware.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum PanelCommand {
-    /// Power the panel on and restore the default theme.
+    /// `30 05 04 00 00 00 03` + `30 05 02 00 04` - power on, battery on, theme 4.
     On,
-    /// Power the panel off.
+    /// `30 05 04 00 00 00 00` + `31 02 00 04` - power off, screen sweep off.
     Off,
-    /// Set the built-in theme (1-4).
+    /// `30 05 02 00 <theme>` - set built-in theme (1-4).
     Theme { value: Theme },
-    /// Set the built-in animation speed (1-3).
+    /// `33 01 <speed>` - set built-in animation speed (1-3).
     Speed { value: Speed },
-    /// Set the built-in clock style (1-2).
+    /// `30 05 01 <clock>` - set clock display layout (1-2).
     Clock { value: ClockStyle },
-    /// Set the clock time format.
+    /// `40 09 <datetime> <format> <weekday>` - set date and time.
     Time { format: TimeFormat },
-    /// Set the content mode (1-3; 2 is host frames).
+    /// `30 06 05 00 00 00 00 <mode>` - set content mode (1-3; 2 is host frames).
     Mode { value: ContentMode },
-    /// Set panel brightness (0-255).
+    /// `35 01 <brightness>` - set brightness (0-255).
     Brightness { value: u8 },
-    /// Enable or disable the boot animation.
+    /// `32 02 <a> <b>` - boot animation (02 02 on, 00 00 off).
     Boot { value: bool },
-    /// Enable or disable the screen sweep effect.
+    /// `31 02 <a> <b>` - screen sweep (02 03 on, 00 04 off).
     Sweep { value: bool },
-    /// Show or hide the battery indicator.
+    /// `30 05 04 00 00 00 <val>` - battery icon (03 on, 01 off).
     Battery { value: bool },
-    /// Report the built-in engine state.
+    /// `f1 03` - query content state (see [`STATE_QUERY`]).
     State,
 }
 
@@ -56,59 +56,95 @@ impl PanelCommand {
     /// [`STATE_QUERY`] for it instead.
     pub fn payloads(&self, now: Time) -> Vec<Vec<u8>> {
         match *self {
-            Self::On => vec![
-                vec![0x30, 0x05, 0x04, 0x00, 0x00, 0x00, 0x03],
-                vec![0x30, 0x05, 0x02, 0x00, 0x04],
-            ],
-            Self::Off => vec![
-                vec![0x30, 0x05, 0x04, 0x00, 0x00, 0x00, 0x00],
-                vec![0x31, 0x02, 0x00, 0x04],
-            ],
-            Self::Theme { value } => {
-                vec![vec![0x30, 0x05, 0x02, 0x00, value.value()]]
-            }
-            Self::Speed { value } => vec![vec![0x33, 0x01, value.value()]],
-            Self::Clock { value } => vec![vec![0x30, 0x05, 0x01, value.value()]],
-            Self::Time { format } => {
-                let mut payload = vec![0x40, 0x09];
-                payload.extend_from_slice(&now.year.to_le_bytes());
-                payload.extend_from_slice(&[
-                    now.month,
-                    now.day,
-                    now.hour,
-                    now.minute,
-                    now.second,
-                    u8::from(format == TimeFormat::H24),
-                    now.weekday,
-                ]);
-                vec![payload]
-            }
-            Self::Mode { value } => vec![vec![
-                0x30,
-                0x06,
-                0x05,
-                0x00,
-                0x00,
-                0x00,
-                0x00,
-                value.value(),
-            ]],
-            Self::Brightness { value } => vec![vec![0x35, 0x01, value]],
-            Self::Boot { value } => {
-                let value = if value { 0x02 } else { 0x00 };
-                vec![vec![0x32, 0x02, value, value]]
-            }
-            Self::Sweep { value } => {
-                let (a, b) = if value { (0x02, 0x03) } else { (0x00, 0x04) };
-                vec![vec![0x31, 0x02, a, b]]
-            }
-            Self::Battery { value } => {
-                let value = if value { 0x03 } else { 0x01 };
-                vec![vec![0x30, 0x05, 0x04, 0x00, 0x00, 0x00, value]]
-            }
+            Self::On => power_on(),
+            Self::Off => power_off(),
+            Self::Theme { value } => vec![set_theme(value)],
+            Self::Speed { value } => vec![set_speed(value)],
+            Self::Clock { value } => vec![set_clock(value)],
+            Self::Time { format } => vec![set_time(format, now)],
+            Self::Mode { value } => vec![set_content_mode(value)],
+            Self::Brightness { value } => vec![set_brightness(value)],
+            Self::Boot { value } => vec![set_boot_animation(value)],
+            Self::Sweep { value } => vec![set_screen_sweep(value)],
+            Self::Battery { value } => vec![set_battery(value)],
             Self::State => Vec::new(),
         }
     }
+}
+
+// 30 05 01 <clock> set clock display layout
+fn set_clock(clock: ClockStyle) -> Vec<u8> {
+    vec![0x30, 0x05, 0x01, clock.value()]
+}
+
+// 30 05 02 00 <theme> set built-in theme
+fn set_theme(theme: Theme) -> Vec<u8> {
+    vec![0x30, 0x05, 0x02, 0x00, theme.value()]
+}
+
+// 30 05 04 00 00 00 <val> set battery icon
+fn set_battery(battery: bool) -> Vec<u8> {
+    let value = if battery { 0x03 } else { 0x01 };
+    vec![0x30, 0x05, 0x04, 0x00, 0x00, 0x00, value]
+}
+
+// 30 06 05 00 00 00 00 <mode> set content mode
+fn set_content_mode(mode: ContentMode) -> Vec<u8> {
+    vec![0x30, 0x06, 0x05, 0x00, 0x00, 0x00, 0x00, mode.value()]
+}
+
+// 31 02 <a> <b> set screen sweep
+fn set_screen_sweep(sweep: bool) -> Vec<u8> {
+    let (a, b) = if sweep { (0x02, 0x03) } else { (0x00, 0x04) };
+    vec![0x31, 0x02, a, b]
+}
+
+// 32 02 <a> <b> boot animation on/off
+fn set_boot_animation(on: bool) -> Vec<u8> {
+    let value = if on { 0x02 } else { 0x00 };
+    vec![0x32, 0x02, value, value]
+}
+
+// 33 01 <speed> set animation speed
+fn set_speed(speed: Speed) -> Vec<u8> {
+    vec![0x33, 0x01, speed.value()]
+}
+
+// 35 01 <brightness> set brightness
+fn set_brightness(value: u8) -> Vec<u8> {
+    vec![0x35, 0x01, value]
+}
+
+// 40 09 <datetime> <format> <weekday> set date and time
+fn set_time(format: TimeFormat, now: Time) -> Vec<u8> {
+    let mut payload = vec![0x40, 0x09];
+    payload.extend_from_slice(&now.year.to_le_bytes());
+    payload.extend_from_slice(&[
+        now.month,
+        now.day,
+        now.hour,
+        now.minute,
+        now.second,
+        u8::from(format == TimeFormat::H24),
+        now.weekday,
+    ]);
+    payload
+}
+
+// Power off
+fn power_off() -> Vec<Vec<u8>> {
+    vec![
+        vec![0x30, 0x05, 0x04, 0x00, 0x00, 0x00, 0x00], // power off
+        vec![0x31, 0x02, 0x00, 0x04],                   // screen sweep off
+    ]
+}
+
+// Power on
+fn power_on() -> Vec<Vec<u8>> {
+    vec![
+        vec![0x30, 0x05, 0x04, 0x00, 0x00, 0x00, 0x03], // battery on
+        vec![0x30, 0x05, 0x02, 0x00, 0x04],             // theme 4
+    ]
 }
 
 /// A validated theme value.

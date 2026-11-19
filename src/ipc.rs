@@ -91,6 +91,7 @@ pub struct Incoming {
 pub struct Paths {
     pub control: PathBuf,
     pub frames: PathBuf,
+    pub preview: PathBuf,
 }
 
 impl Paths {
@@ -103,6 +104,7 @@ impl Paths {
         Ok(Self {
             control: directory.join("zenvision.sock"),
             frames: directory.join("zenvision-frames.sock"),
+            preview: directory.join("zenvision-preview.sock"),
         })
     }
 }
@@ -131,23 +133,32 @@ pub fn is_running(paths: &Paths) -> bool {
     UnixStream::connect(&paths.control).is_ok()
 }
 
-/// Bind both sockets.
+/// Bind the control, frame and preview sockets.
+///
+/// The preview listener is returned separately so the caller can hand it to
+/// [`crate::preview::PreviewHub`].
 ///
 /// # Errors
 /// Fails when a socket path cannot be bound or listened on.
-pub fn bind(paths: &Paths) -> io::Result<Server> {
+pub fn bind(paths: &Paths) -> io::Result<(Server, Socket)> {
     let _ = fs::remove_file(&paths.control);
     let control = UnixListener::bind(&paths.control)?;
     fs::set_permissions(&paths.control, fs::Permissions::from_mode(0o600))?;
     control.set_nonblocking(false)?;
 
-    let _ = fs::remove_file(&paths.frames);
-    let frames = Socket::new(Domain::UNIX, Type::SEQPACKET, None)?;
-    frames.bind(&SockAddr::unix(&paths.frames)?)?;
-    frames.listen(4)?;
-    fs::set_permissions(&paths.frames, fs::Permissions::from_mode(0o600))?;
+    let frames = bind_seqpacket(&paths.frames)?;
+    let preview = bind_seqpacket(&paths.preview)?;
 
-    Ok(Server { control, frames })
+    Ok((Server { control, frames }, preview))
+}
+
+fn bind_seqpacket(path: &Path) -> io::Result<Socket> {
+    let _ = fs::remove_file(path);
+    let socket = Socket::new(Domain::UNIX, Type::SEQPACKET, None)?;
+    socket.bind(&SockAddr::unix(path)?)?;
+    socket.listen(4)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(socket)
 }
 
 pub struct Server {
@@ -384,6 +395,28 @@ pub fn connect_frames(paths: &Paths) -> io::Result<UnixStream> {
     let socket = Socket::new(Domain::UNIX, Type::SEQPACKET, None)?;
     socket.connect(&SockAddr::unix(&paths.frames)?)?;
     socket_into_stream(socket)
+}
+
+/// Connect to the daemon's preview socket.
+///
+/// Returns `Ok(None)` when no daemon is listening.
+///
+/// # Errors
+/// Propagates socket creation and connection errors other than "not running".
+pub fn connect_preview(paths: &Paths) -> io::Result<Option<UnixStream>> {
+    let socket = Socket::new(Domain::UNIX, Type::SEQPACKET, None)?;
+    match socket.connect(&SockAddr::unix(&paths.preview)?) {
+        Ok(()) => Ok(Some(socket_into_stream(socket)?)),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]

@@ -9,9 +9,9 @@ use super::{Animation, Status};
 use crate::canvas::{Canvas, HEIGHT, WIDTH};
 use crate::protocol::SpeedMultiplier;
 
-const DEFAULT_STARS: u32 = 90;
-const DEFAULT_TRAIL: u8 = 66;
-const MAX_STARS: u32 = 100_000;
+pub const DEFAULT_STARS: u32 = 40;
+pub const DEFAULT_TRAIL: u8 = 40;
+pub const MAX_STARS: u32 = 1_000_000;
 
 // Projection scale used by the renderer below. Keeping the spawn frustum in
 // sync with it guarantees that every star is visible when it appears.
@@ -124,11 +124,6 @@ struct Star {
 }
 
 /// Place a star inside the visible frustum at depth `z`.
-///
-/// The panel only shows `|y / z| < HEIGHT / (2 * SCALE)`, so spawning `y` in
-/// `-1..1` leaves roughly half the stars permanently off-screen as they move
-/// outward. Scaling both axes by the frustum at `z` makes every star visible
-/// when it appears while preserving the projection and speed.
 fn spawn(rng: &mut Rng, star: &mut Star, z: f32) {
     star.x = rng.range(-1.0, 1.0) * (X_AT_UNIT_Z * z * SPAWN_MARGIN).min(1.0);
     star.y = rng.range(-1.0, 1.0) * Y_AT_UNIT_Z * z * SPAWN_MARGIN;

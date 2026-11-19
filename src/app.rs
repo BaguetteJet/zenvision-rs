@@ -21,8 +21,9 @@ use crate::canvas::Canvas;
 use crate::device::is_panel;
 use crate::event::Event;
 use crate::ipc::{self, Command, Paths, Reply};
-use crate::panel::{Panel, RealPanel};
-use crate::protocol::{BUILTIN_MODE, ContentMode, Fps, PanelCommand};
+use crate::panel::{Panel, TeePanel};
+use crate::preview::PreviewHub;
+use crate::protocol::{BUILTIN_DISPLAY, ContentMode, Fps, PanelCommand};
 use crate::render::Player;
 use crate::state::State;
 
@@ -48,7 +49,8 @@ pub fn run() -> io::Result<()> {
     spawn_signals(events_tx.clone())?;
     spawn_hotplug(events_tx.clone());
 
-    let server = ipc::bind(&paths)?;
+    let (server, preview_socket) = ipc::bind(&paths)?;
+    let preview = PreviewHub::spawn(preview_socket);
     let (frame_tx, frame_rx) = mpsc::sync_channel(1);
     let (spare_tx, spare_rx) = mpsc::sync_channel(1);
     server.spawn(events_tx.clone(), frame_tx, spare_rx);
@@ -66,8 +68,10 @@ pub fn run() -> io::Result<()> {
         live_canvas: Canvas::new(),
         frame_rx,
         spare_tx,
+        preview,
         last_error: None,
     };
+    app.update_preview();
     app.try_open();
     app.run(events_rx)
 }
@@ -118,13 +122,14 @@ struct App {
     paths: Paths,
     state: State,
     player: Player,
-    panel: Option<RealPanel>,
+    panel: Option<TeePanel>,
     device_id: Option<DeviceId>,
     live: bool,
     live_has_frame: bool,
     live_canvas: Canvas,
     frame_rx: Receiver<Vec<u8>>,
     spare_tx: SyncSender<Vec<u8>>,
+    preview: PreviewHub,
     last_error: Option<String>,
 }
 
@@ -210,6 +215,7 @@ impl App {
             Ok(Status::Ended) => {
                 self.state.playing = false;
                 self.save();
+                self.update_preview();
             }
             Ok(_) => {}
             Err(error) => self.panel_failed(error),
@@ -222,15 +228,21 @@ impl App {
             Err(_) => return,
         };
 
-        let canvas = &mut self.live_canvas;
-        let changed = !self.live_has_frame || frame.as_slice() != canvas.pixels();
-        let result = if changed {
-            canvas
-                .set_grayscale(&frame)
-                .and_then(|()| match self.panel.as_mut() {
-                    Some(panel) => panel.frame(canvas),
-                    None => Ok(()),
-                })
+        // A theme, clock, or powered-off panel owns the display. Keep draining
+        // the producer so it self-paces, but do not send frames over it.
+        let result = if self.state.playing {
+            let canvas = &mut self.live_canvas;
+            let changed = !self.live_has_frame || frame.as_slice() != canvas.pixels();
+            if changed {
+                canvas
+                    .set_grayscale(&frame)
+                    .and_then(|()| match self.panel.as_mut() {
+                        Some(panel) => panel.frame(canvas),
+                        None => Ok(()),
+                    })
+            } else {
+                Ok(())
+            }
         } else {
             Ok(())
         };
@@ -240,7 +252,7 @@ impl App {
         match result {
             Ok(()) => {
                 self.live = true;
-                self.live_has_frame = true;
+                self.live_has_frame = self.state.playing;
             }
             Err(error) => self.panel_failed(error),
         }
@@ -253,10 +265,8 @@ impl App {
             self.player.resume();
         } else {
             self.player.pause();
-            if let Some(panel) = self.panel.as_mut() {
-                let _ = panel.apply(&BUILTIN_MODE);
-            }
         }
+        self.update_preview();
         println!("frame producer disconnected");
     }
 
@@ -265,7 +275,7 @@ impl App {
             return;
         }
 
-        let mut panel = match RealPanel::open() {
+        let mut panel = match TeePanel::open(self.preview.clone()) {
             Ok(panel) => panel,
             Err(error) => {
                 let message = error.to_string();
@@ -273,6 +283,7 @@ impl App {
                     eprintln!("waiting for panel: {error}");
                     self.last_error = Some(message);
                 }
+                self.update_preview();
                 return;
             }
         };
@@ -289,6 +300,7 @@ impl App {
         self.live = false;
         self.live_has_frame = false;
         self.last_error = None;
+        self.update_preview();
         println!("panel connected");
     }
 
@@ -308,11 +320,10 @@ impl App {
         self.state.fps = fps;
         self.state.playing = true;
         self.save();
+        self.update_preview();
 
-        if self.live {
-            return Reply::message("saved; a live producer owns the display");
-        }
-
+        // This also takes the panel back from a theme/clock display, and
+        // re-asserts image mode for a still-connected live producer.
         match self.begin_streaming() {
             Ok(()) => Reply::ok(),
             Err(message) => Reply::error(message),
@@ -330,24 +341,24 @@ impl App {
         }
 
         match &command {
-            PanelCommand::On => {
-                self.state.playing = true;
-                self.player.resume();
-                self.save();
-            }
-            PanelCommand::Off => {
+            // Built-in displays run on the panel itself. Streaming must stop:
+            // host frames must not be sent over a theme or clock.
+            PanelCommand::On
+            | PanelCommand::Off
+            | PanelCommand::Theme { .. }
+            | PanelCommand::Clock { .. }
+            | PanelCommand::Mode {
+                value: ContentMode::One | ContentMode::Three,
+            } => {
                 self.state.playing = false;
                 self.player.pause();
                 self.save();
             }
-            PanelCommand::Mode { value } => {
-                let streaming = *value == ContentMode::Two;
-                self.state.playing = streaming;
-                if streaming {
-                    self.player.resume();
-                } else {
-                    self.player.pause();
-                }
+            PanelCommand::Mode {
+                value: ContentMode::Two,
+            } => {
+                self.state.playing = true;
+                self.player.resume();
                 self.save();
             }
             PanelCommand::Time { format } => {
@@ -358,19 +369,25 @@ impl App {
                 self.state.brightness = Some(*value);
                 self.save();
             }
-            _ => {}
+            PanelCommand::Speed { .. }
+            | PanelCommand::Boot { .. }
+            | PanelCommand::Sweep { .. }
+            | PanelCommand::Battery { .. }
+            | PanelCommand::State => {}
         }
+
+        // Reflect the new streaming state immediately, even if the panel
+        // command itself takes a while.
+        self.update_preview();
 
         match self.panel_apply(&command) {
             Ok(_) => {
-                let wants_streaming = matches!(command, PanelCommand::On)
-                    || matches!(
-                        command,
-                        PanelCommand::Mode {
-                            value: ContentMode::Two
-                        }
-                    );
-                if wants_streaming && !self.live {
+                if matches!(
+                    command,
+                    PanelCommand::Mode {
+                        value: ContentMode::Two
+                    }
+                ) {
                     match self.begin_streaming() {
                         Ok(()) => Reply::ok(),
                         Err(message) => Reply::error(message),
@@ -384,7 +401,7 @@ impl App {
     }
 
     fn begin_streaming(&mut self) -> Result<(), String> {
-        if self.panel.is_none() || self.live {
+        if self.panel.is_none() {
             return Ok(());
         }
         self.panel_apply(&PanelCommand::Mode {
@@ -416,6 +433,14 @@ impl App {
         self.device_id = None;
         self.live = false;
         self.live_has_frame = false;
+        self.update_preview();
+    }
+
+    /// The preview mirrors host frames only while the panel is connected and
+    /// actually receiving them.
+    fn update_preview(&self) {
+        self.preview
+            .set_streaming(self.state.playing && self.panel.is_some());
     }
 
     fn save(&self) {
@@ -425,27 +450,40 @@ impl App {
     }
 
     fn shutdown(&mut self) {
-        if let Some(panel) = self.panel.as_mut()
-            && let Err(error) = panel.apply(&BUILTIN_MODE)
+        // Only replace host frames. A theme, clock, or powered-off panel is
+        // already a built-in display and should be left alone.
+        if self.state.playing
+            && let Some(panel) = self.panel.as_mut()
+            && let Err(error) = panel.apply(&BUILTIN_DISPLAY)
         {
             eprintln!("warning: could not restore built-in mode: {error}");
         }
 
         let _ = std::fs::remove_file(&self.paths.control);
         let _ = std::fs::remove_file(&self.paths.frames);
+        let _ = std::fs::remove_file(&self.paths.preview);
     }
 }
 
+/// Install a SIGINT/SIGTERM flag shared by the foreground loops.
+///
+/// # Errors
+/// Propagates signal registration failures.
+pub fn stop_flag() -> io::Result<Arc<AtomicBool>> {
+    let stop = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(SIGINT, Arc::clone(&stop))?;
+    signal_hook::flag::register(SIGTERM, Arc::clone(&stop))?;
+    Ok(stop)
+}
+
 /// Run a native animation in the foreground (used by `anim` without a daemon
-/// and by `preview`). The shared [`Player`] keeps this loop as small as the
-/// daemon's, and a signal restores the built-in mode.
+/// and by `preview` when no daemon is running). The shared [`Player`] keeps
+/// this loop as small as the daemon's, and a signal restores the built-in mode.
 ///
 /// # Errors
 /// Propagates panel failures.
 pub fn run_animation(panel: &mut dyn Panel, mut player: Player) -> io::Result<()> {
-    let stop = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(SIGINT, Arc::clone(&stop))?;
-    signal_hook::flag::register(SIGTERM, Arc::clone(&stop))?;
+    let stop = stop_flag()?;
 
     let result = (|| {
         panel.apply(&PanelCommand::Mode {
@@ -469,6 +507,6 @@ pub fn run_animation(panel: &mut dyn Panel, mut player: Player) -> io::Result<()
         Ok(())
     })();
 
-    let _ = panel.apply(&BUILTIN_MODE);
+    let _ = panel.apply(&BUILTIN_DISPLAY);
     result
 }

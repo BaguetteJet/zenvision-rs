@@ -11,6 +11,7 @@ use crate::app;
 use crate::canvas::GRAYSCALE_BYTES;
 use crate::ipc::{self, Reply};
 use crate::panel::{Panel, RealPanel, TerminalPanel};
+use crate::preview;
 use crate::protocol::{
     ClockStyle, ContentMode, Fps, PanelCommand, Speed, SpeedMultiplier, Theme, TimeFormat,
 };
@@ -68,7 +69,7 @@ enum Command {
     State,
     /// Play a custom animation
     Anim(AnimArgs),
-    /// Render an animation in the terminal (no hardware)
+    /// Mirror the panel in the terminal (local preview without a daemon)
     Preview(AnimArgs),
     /// Stream raw 256x64 grayscale frames from stdin to the daemon
     Stream(StreamArgs),
@@ -94,13 +95,21 @@ enum AnimationArg {
 #[derive(Args)]
 struct StarfieldArgs {
     /// Number of stars
-    #[arg(long, default_value_t = 90, value_parser = clap::value_parser!(u32).range(0..=100_000))]
+    #[arg(
+        long,
+        default_value_t = starfield::DEFAULT_STARS,
+        value_parser = clap::value_parser!(u32).range(0..=i64::from(starfield::MAX_STARS))
+    )]
     stars: u32,
     /// Speed multiplier
     #[arg(long, default_value = "1.0", value_parser = parse_multiplier)]
     speed: SpeedMultiplier,
     /// Trail pixels percentage
-    #[arg(long, default_value_t = 66, value_parser = clap::value_parser!(u8).range(0..=100))]
+    #[arg(
+        long,
+        default_value_t = starfield::DEFAULT_TRAIL,
+        value_parser = clap::value_parser!(u8).range(0..=100)
+    )]
     trail: u8,
 }
 
@@ -299,6 +308,16 @@ fn anim(args: AnimArgs) -> io::Result<()> {
 }
 
 fn preview(args: AnimArgs) -> io::Result<()> {
+    let paths = ipc::Paths::new()?;
+
+    // With a daemon running, show exactly the frames the panel receives
+    // (including animation changes and pauses for theme/clock).
+    if let Some(stream) = ipc::connect_preview(&paths)? {
+        let mut panel = TerminalPanel::new();
+        return preview::follow(stream, &mut panel);
+    }
+
+    // No daemon: render the requested animation locally.
     let (kind, fps) = animation(args);
     let mut panel = TerminalPanel::new();
     let player = Player::new(kind, fps);
