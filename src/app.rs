@@ -2,13 +2,13 @@
 //!
 //! One thread owns the USB device, the player and the persisted state. Helper
 //! threads (IPC, frame producer, hotplug, signals) only push events. Live
-//! frames are displayed on the loop's own deadline, so the producer is paced
-//! by `fps` and never by its own send speed.
+//! frames are displayed on the loop's own deadline; older pending frames are
+//! dropped so a fast producer cannot accumulate latency.
 
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,7 @@ use crate::animation::{AnimationKind, Status};
 use crate::canvas::Canvas;
 use crate::device::is_panel;
 use crate::event::Event;
-use crate::ipc::{self, Command, Paths, Reply};
+use crate::ipc::{self, Command, FrameMailbox, Paths, Reply};
 use crate::panel::{Panel, TeePanel};
 use crate::preview::PreviewHub;
 use crate::protocol::{BUILTIN_DISPLAY, ContentMode, Fps, PanelCommand, Theme};
@@ -53,9 +53,8 @@ pub fn run() -> io::Result<()> {
 
     let (server, preview_socket) = ipc::bind(&paths)?;
     let preview = PreviewHub::spawn(preview_socket);
-    let (frame_tx, frame_rx) = mpsc::sync_channel(1);
-    let (spare_tx, spare_rx) = mpsc::sync_channel(1);
-    server.spawn(events_tx, frame_tx, spare_rx);
+    let frames = Arc::new(FrameMailbox::new());
+    server.spawn(events_tx, Arc::clone(&frames));
 
     println!("zenvision daemon on {}", paths.control.display());
 
@@ -66,10 +65,7 @@ pub fn run() -> io::Result<()> {
         state,
         player,
         open,
-        FrameIo {
-            rx: frame_rx,
-            spare: spare_tx,
-        },
+        frames,
         Some(preview),
         RECONNECT_PERIOD,
     );
@@ -119,12 +115,6 @@ fn spawn_hotplug(events: mpsc::Sender<Event>) {
         });
 }
 
-/// The frame channel and the recycled-buffer channel.
-struct FrameIo {
-    rx: Receiver<Vec<u8>>,
-    spare: SyncSender<Vec<u8>>,
-}
-
 /// The newest live frame and its display schedule.
 struct Live {
     /// A producer has sent a frame and owns the display while it keeps sending.
@@ -134,7 +124,6 @@ struct Live {
     /// Re-send `canvas` even without a new incoming frame.
     dirty: bool,
     canvas: Canvas,
-    pending: Option<Vec<u8>>,
     next: Instant,
 }
 
@@ -145,7 +134,6 @@ impl Live {
             has_frame: false,
             dirty: false,
             canvas: Canvas::new(),
-            pending: None,
             next: now,
         }
     }
@@ -154,7 +142,6 @@ impl Live {
         self.active = false;
         self.has_frame = false;
         self.dirty = false;
-        self.pending = None;
         self.canvas.clear();
     }
 }
@@ -167,7 +154,7 @@ struct App<F> {
     panel: Option<Box<dyn Panel>>,
     device_id: Option<DeviceId>,
     live: Live,
-    frames: FrameIo,
+    frames: Arc<FrameMailbox>,
     preview: Option<PreviewHub>,
     last_error: Option<String>,
     next_retry: Instant,
@@ -186,7 +173,7 @@ where
         state: State,
         player: Player,
         open: F,
-        frames: FrameIo,
+        frames: Arc<FrameMailbox>,
         preview: Option<PreviewHub>,
         reconnect_period: Duration,
     ) -> Self {
@@ -275,19 +262,19 @@ where
     fn deadline(&self) -> Option<Instant> {
         if self.panel.is_none() {
             let mut deadline = self.next_retry;
-            if self.live.pending.is_some() || self.live.dirty {
+            if self.frames.has_frame() || self.live.dirty {
                 deadline = deadline.min(self.live.next);
             }
             return Some(deadline);
         }
 
         let mut deadline = self.next_time_sync;
-        if self.live.active {
-            if self.live.pending.is_some() || self.live.dirty {
-                deadline = deadline.min(self.live.next);
+        if self.frames.has_frame() || self.live.dirty {
+            deadline = deadline.min(self.live.next);
+        } else if !self.live.active {
+            if let Some(next) = self.player.next_deadline() {
+                deadline = deadline.min(next);
             }
-        } else if let Some(next) = self.player.next_deadline() {
-            deadline = deadline.min(next);
         }
         Some(deadline)
     }
@@ -298,7 +285,7 @@ where
         if self.panel.is_none() && now >= self.next_retry {
             self.try_open();
         }
-        if (self.live.pending.is_some() || self.live.dirty) && now >= self.live.next {
+        if (self.frames.has_frame() || self.live.dirty) && now >= self.live.next {
             self.display_live();
         }
         if self.panel.is_none() {
@@ -343,8 +330,7 @@ where
     }
 
     fn display_live(&mut self) {
-        let now = Instant::now();
-        let frame = self.live.pending.take();
+        let frame = self.frames.take();
         let displaying = self.panel.is_some() && self.state.playing;
         let mut result = Ok(());
 
@@ -363,15 +349,22 @@ where
         }
 
         if let Some(frame) = frame {
-            let _ = self.frames.spare.send(frame);
+            self.frames.recycle(frame);
         }
         self.live.dirty = false;
-        self.live.next = now
-            + if displaying {
-                period(self.player.fps())
-            } else {
-                DRAIN_PERIOD
-            };
+
+        // Fixed-deadline scheduling. Advancing the previous deadline avoids
+        // accumulating USB and event-loop overhead into the frame rate.
+        let interval = if displaying {
+            period(self.player.fps())
+        } else {
+            DRAIN_PERIOD
+        };
+        self.live.next += interval;
+        let now = Instant::now();
+        if self.live.next <= now {
+            self.live.next = now + interval;
+        }
 
         if let Err(error) = result {
             self.panel_failed(error);
@@ -379,23 +372,16 @@ where
     }
 
     fn on_frame(&mut self) {
-        let Ok(frame) = self.frames.rx.recv() else {
-            return;
-        };
-
         if !self.live.active {
             self.live.active = true;
             self.live.next = Instant::now();
             self.player.pause();
         }
-
-        if let Some(old) = self.live.pending.replace(frame) {
-            let _ = self.frames.spare.send(old);
-        }
     }
 
     fn on_producer_gone(&mut self) {
         let was_active = self.live.active;
+        self.frames.clear();
         self.live.clear();
         if self.state.playing {
             self.player.resume();
@@ -646,11 +632,13 @@ where
 
     fn shutdown(&mut self) {
         // Only replace host frames. A theme, clock, or powered-off panel is
-        // already a built-in display and should be left alone.
+        // already a built-in display and should be left alone. Stopping the
+        // daemon returns the panel to the built-in theme.
         if self.state.playing {
             if let Some(panel) = self.panel.as_mut() {
-                if let Err(error) = panel.apply(&BUILTIN_DISPLAY) {
-                    eprintln!("warning: could not restore built-in mode: {error}");
+                let theme = PanelCommand::Theme { value: Theme::FOUR };
+                if let Err(error) = panel.apply(&theme) {
+                    eprintln!("warning: could not restore built-in theme: {error}");
                 }
             }
         }
@@ -758,13 +746,10 @@ mod tests {
 
     type TestOpen = Box<dyn FnMut() -> io::Result<Box<dyn Panel>>>;
     type PanelSlot = Arc<Mutex<Option<FakePanel>>>;
-    type TestParts = (App<TestOpen>, SyncSender<Vec<u8>>, PanelSlot);
+    type TestParts = (App<TestOpen>, Arc<FrameMailbox>, PanelSlot);
 
     fn test_app(state: State, panel: Option<FakePanel>) -> TestParts {
-        let (frame_tx, frame_rx) = mpsc::sync_channel(1);
-        // Capacity for all frames a single test displays; nothing drains it.
-        let (spare_tx, spare_rx) = mpsc::sync_channel(16);
-        std::mem::forget(spare_rx);
+        let frames = Arc::new(FrameMailbox::new());
 
         let slot = Arc::new(Mutex::new(panel));
         let open_slot = Arc::clone(&slot);
@@ -784,15 +769,12 @@ mod tests {
             state,
             player,
             open,
-            FrameIo {
-                rx: frame_rx,
-                spare: spare_tx,
-            },
+            Arc::clone(&frames),
             None,
             Duration::from_millis(20),
         );
         app.persist = false;
-        (app, frame_tx, slot)
+        (app, frames, slot)
     }
 
     fn playing_state() -> State {
@@ -805,7 +787,7 @@ mod tests {
 
     #[test]
     fn reconnect_deadline_does_not_move() {
-        let (mut app, _frame_tx, _slot) = test_app(State::default(), None);
+        let (mut app, _frames, _slot) = test_app(State::default(), None);
         app.try_open(); // fails and schedules the retry
 
         let first = app.deadline().unwrap();
@@ -816,7 +798,7 @@ mod tests {
 
     #[test]
     fn offline_theme_is_recorded_and_replayed_on_connect() {
-        let (mut app, _frame_tx, slot) = test_app(State::default(), None);
+        let (mut app, _frames, slot) = test_app(State::default(), None);
         app.try_open();
 
         let theme = Theme::new(3).unwrap();
@@ -839,7 +821,7 @@ mod tests {
 
     #[test]
     fn offline_momentary_command_is_rejected() {
-        let (mut app, _frame_tx, _slot) = test_app(State::default(), None);
+        let (mut app, _frames, _slot) = test_app(State::default(), None);
         app.try_open();
 
         let reply = app.apply(Command::Panel(PanelCommand::Boot { value: true }));
@@ -849,11 +831,11 @@ mod tests {
     #[test]
     fn live_frames_wait_for_the_loop_deadline() {
         let panel = FakePanel::default();
-        let (mut app, frame_tx, _slot) = test_app(playing_state(), Some(panel.clone()));
+        let (mut app, frames, _slot) = test_app(playing_state(), Some(panel.clone()));
         app.try_open();
         assert_eq!(panel.frames(), 0);
 
-        frame_tx.send(vec![7u8; GRAYSCALE_BYTES]).unwrap();
+        frames.put(vec![7u8; GRAYSCALE_BYTES]);
         app.handle(Event::FrameReady);
         assert_eq!(panel.frames(), 0);
 
@@ -862,7 +844,7 @@ mod tests {
         assert_eq!(panel.frames(), 1);
         assert!(panel.last_frame().iter().all(|&pixel| pixel == 7));
 
-        frame_tx.send(vec![9u8; GRAYSCALE_BYTES]).unwrap();
+        frames.put(vec![9u8; GRAYSCALE_BYTES]);
         app.handle(Event::FrameReady);
         assert_eq!(panel.frames(), 1);
 
@@ -873,12 +855,33 @@ mod tests {
     }
 
     #[test]
-    fn live_frame_is_resent_after_reconnect() {
+    fn live_deadline_advances_from_the_previous_slot() {
         let panel = FakePanel::default();
-        let (mut app, frame_tx, _slot) = test_app(playing_state(), Some(panel.clone()));
+        let (mut app, frames, _slot) = test_app(playing_state(), Some(panel.clone()));
         app.try_open();
 
-        frame_tx.send(vec![42u8; GRAYSCALE_BYTES]).unwrap();
+        let interval = period(app.player.fps());
+        app.live.next = Instant::now();
+        frames.put(vec![7u8; GRAYSCALE_BYTES]);
+        app.handle(Event::FrameReady);
+        app.display_live();
+        let first = app.live.next;
+
+        frames.put(vec![9u8; GRAYSCALE_BYTES]);
+        app.handle(Event::FrameReady);
+        app.display_live();
+        let second = app.live.next;
+
+        assert_eq!(second.duration_since(first), interval);
+    }
+
+    #[test]
+    fn live_frame_is_resent_after_reconnect() {
+        let panel = FakePanel::default();
+        let (mut app, frames, _slot) = test_app(playing_state(), Some(panel.clone()));
+        app.try_open();
+
+        frames.put(vec![42u8; GRAYSCALE_BYTES]);
         app.handle(Event::FrameReady);
         app.live.next = Instant::now();
         app.on_deadline();
@@ -895,7 +898,7 @@ mod tests {
     #[test]
     fn idle_loop_syncs_the_clock_hourly() {
         let panel = FakePanel::default();
-        let (mut app, _frame_tx, _slot) = test_app(State::default(), Some(panel.clone()));
+        let (mut app, _frames, _slot) = test_app(State::default(), Some(panel.clone()));
         app.try_open();
 
         app.next_time_sync = Instant::now();
@@ -911,19 +914,20 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_restores_the_builtin_clock_only_while_streaming() {
+    fn shutdown_restores_theme_four_only_while_streaming() {
+        let theme = PanelCommand::Theme { value: Theme::FOUR };
         let panel = FakePanel::default();
-        let (mut app, _frame_tx, _slot) = test_app(playing_state(), Some(panel.clone()));
+        let (mut app, _frames, _slot) = test_app(playing_state(), Some(panel.clone()));
         app.try_open();
         app.shutdown();
 
-        assert!(panel.commands().contains(&BUILTIN_DISPLAY));
+        assert!(panel.commands().contains(&theme));
 
         let panel = FakePanel::default();
-        let (mut app, _frame_tx, _slot) = test_app(State::default(), Some(panel.clone()));
+        let (mut app, _frames, _slot) = test_app(State::default(), Some(panel.clone()));
         app.try_open();
         app.shutdown();
 
-        assert!(!panel.commands().contains(&BUILTIN_DISPLAY));
+        assert!(!panel.commands().contains(&theme));
     }
 }

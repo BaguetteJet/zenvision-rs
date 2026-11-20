@@ -287,9 +287,9 @@ fn stream(args: StreamArgs) -> io::Result<()> {
         )
     })?;
 
-    // The daemon displays at its own rate and only then accepts the next
-    // message, so these writes block instead of building a queue. A running
-    // daemon also resumes host frames and optionally adopts the new rate.
+    // The daemon keeps only the newest pending frame, so these writes do not
+    // need to wait for a display. A running daemon resumes host frames and
+    // optionally adopts the new rate; producers should pace themselves.
     let request = ipc::Command::Play {
         animation: None,
         fps: args.fps,

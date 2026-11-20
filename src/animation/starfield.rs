@@ -14,7 +14,7 @@ pub const DEFAULT_STARS: u32 = 40;
 pub const DEFAULT_TRAIL: u8 = 40;
 /// More stars than the panel has pixels only costs CPU and produces the same
 /// saturated image, so keep the option inside a sane budget.
-pub const MAX_STARS: u32 = 10_000;
+pub const MAX_STARS: u32 = 1_000_000;
 
 // Projection scale used by the renderer below. Keeping the spawn frustum in
 // sync with it guarantees that every star is visible when it appears.

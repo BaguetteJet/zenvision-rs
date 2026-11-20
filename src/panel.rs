@@ -298,6 +298,9 @@ fn push_rgb_bg(out: &mut String, bg: u8) {
     let _ = write!(out, "\x1b[48;2;{bg};{bg};{bg}m");
 }
 
+// The index drives both the exact 2x3 block coordinates and the resampled
+// lookup, so an iterator over one of them would not simplify this loop.
+#[allow(clippy::needless_range_loop)]
 fn render(canvas: &Canvas, out: &mut String, cols: usize, rows: usize) {
     let pixels = canvas.pixels();
     let display_cols = cols.clamp(1, PREVIEW_COLS);

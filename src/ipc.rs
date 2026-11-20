@@ -12,7 +12,8 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -44,6 +45,83 @@ const FRAME_MESSAGE_BYTES: usize = GRAYSCALE_BYTES + 1;
 /// One byte of slack lets `read` distinguish an oversized datagram from a
 /// valid one; SOCK_SEQPACKET truncates anything larger.
 const RECEIVE_BYTES: usize = FRAME_MESSAGE_BYTES + 1;
+/// Enough buffers for the frame thread, the pending slot and the display.
+const RECYCLED_BUFFERS: usize = 4;
+
+/// The newest frame waiting for the event loop.
+///
+/// The frame thread drains its socket continuously and replaces this slot, so
+/// overload drops old frames instead of building latency. Buffers are returned
+/// to a small pool for reuse.
+#[derive(Default)]
+pub struct FrameMailbox {
+    newest: Mutex<Option<Vec<u8>>>,
+    recycled: Mutex<Vec<Vec<u8>>>,
+}
+
+impl FrameMailbox {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Store `frame`, replacing and recycling any older pending frame.
+    ///
+    /// Returns true when the slot was empty, meaning the event loop needs a
+    /// `FrameReady` notification.
+    pub(crate) fn put(&self, frame: Vec<u8>) -> bool {
+        let (was_empty, old) = {
+            let mut newest = self
+                .newest
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let was_empty = newest.is_none();
+            (was_empty, newest.replace(frame))
+        };
+
+        if let Some(old) = old {
+            self.recycle(old);
+        }
+        was_empty
+    }
+
+    pub(crate) fn take(&self) -> Option<Vec<u8>> {
+        self.newest
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+
+    pub(crate) fn has_frame(&self) -> bool {
+        self.newest
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some()
+    }
+
+    pub(crate) fn clear(&self) {
+        if let Some(frame) = self.take() {
+            self.recycle(frame);
+        }
+    }
+
+    pub(crate) fn recycle(&self, frame: Vec<u8>) {
+        let mut recycled = self
+            .recycled
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if recycled.len() < RECYCLED_BUFFERS {
+            recycled.push(frame);
+        }
+    }
+
+    fn acquire(&self) -> Vec<u8> {
+        self.recycled
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pop()
+            .unwrap_or_else(|| vec![0u8; RECEIVE_BYTES])
+    }
+}
 
 /// One control-socket request.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -201,12 +279,7 @@ impl Server {
     ///
     /// A stalled client only ties up its own thread: reads have a timeout and a
     /// length cap, so the frame loop is never blocked.
-    pub fn spawn(
-        self,
-        events: Sender<Event>,
-        frame_tx: SyncSender<Vec<u8>>,
-        spare_rx: Receiver<Vec<u8>>,
-    ) {
+    pub fn spawn(self, events: Sender<Event>, frames: Arc<FrameMailbox>) {
         let control_events = events.clone();
         if let Err(error) = thread::Builder::new()
             .name("zenvision-ipc".into())
@@ -217,7 +290,7 @@ impl Server {
 
         if let Err(error) = thread::Builder::new()
             .name("zenvision-frames".into())
-            .spawn(move || serve_frames(self.frames, events, frame_tx, spare_rx))
+            .spawn(move || serve_frames(self.frames, events, frames))
         {
             eprintln!("warning: could not start frame thread: {error}");
         }
@@ -315,19 +388,14 @@ fn write_reply(stream: &UnixStream, reply: &Reply) -> io::Result<()> {
     writer.flush()
 }
 
-fn serve_frames(
-    listener: Socket,
-    events: Sender<Event>,
-    frame_tx: SyncSender<Vec<u8>>,
-    spare_rx: Receiver<Vec<u8>>,
-) {
+fn serve_frames(listener: Socket, events: Sender<Event>, frames: Arc<FrameMailbox>) {
     loop {
         match listener.accept() {
             Ok((socket, _)) => {
                 let Ok(stream) = socket_into_stream(socket) else {
                     continue;
                 };
-                read_frames(&stream, &events, &frame_tx, &spare_rx);
+                read_frames(&stream, &events, &frames);
                 let _ = events.send(Event::ProducerGone);
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -339,12 +407,7 @@ fn serve_frames(
     }
 }
 
-fn read_frames(
-    mut stream: &UnixStream,
-    events: &Sender<Event>,
-    frame_tx: &SyncSender<Vec<u8>>,
-    spare_rx: &Receiver<Vec<u8>>,
-) {
+fn read_frames(mut stream: &UnixStream, events: &Sender<Event>, frames: &FrameMailbox) {
     if stream
         .set_read_timeout(Some(PRODUCER_IDLE_TIMEOUT))
         .is_err()
@@ -352,8 +415,9 @@ fn read_frames(
         return;
     }
 
-    let mut buffer = vec![0u8; RECEIVE_BYTES];
+    let mut buffer = frames.acquire();
     loop {
+        buffer.resize(RECEIVE_BYTES, 0);
         match stream.read(&mut buffer) {
             Ok(0) => return,
             Ok(size) if size > FRAME_MESSAGE_BYTES => {
@@ -364,15 +428,14 @@ fn read_frames(
                 if buffer[0] == TAG_FRAME && size == FRAME_MESSAGE_BYTES {
                     buffer.copy_within(1..size, 0);
                     buffer.truncate(GRAYSCALE_BYTES);
-                    if frame_tx.send(buffer).is_err() || events.send(Event::FrameReady).is_err() {
+
+                    // Keep draining the socket even if the loop has not taken
+                    // the previous frame. Only the newest one survives.
+                    let next = frames.acquire();
+                    let frame = std::mem::replace(&mut buffer, next);
+                    if frames.put(frame) && events.send(Event::FrameReady).is_err() {
                         return;
                     }
-                    // Wait for the loop to hand the buffer back. The loop
-                    // displays at its own rate, so this paces the producer.
-                    buffer = spare_rx
-                        .recv()
-                        .unwrap_or_else(|_| vec![0u8; GRAYSCALE_BYTES]);
-                    buffer.resize(RECEIVE_BYTES, 0);
                 } else if buffer[0] == TAG_INPUT
                     && size > 1
                     && events.send(Event::Input(buffer[1..size].to_vec())).is_err()
@@ -527,18 +590,18 @@ mod tests {
         let stream = socket_into_stream(server).unwrap();
 
         let (events_tx, events_rx) = mpsc::channel();
-        let (frame_tx, frame_rx) = mpsc::sync_channel(1);
-        let (spare_tx, spare_rx) = mpsc::sync_channel(1);
-        let reader = thread::spawn(move || read_frames(&stream, &events_tx, &frame_tx, &spare_rx));
+        let frames = Arc::new(FrameMailbox::new());
+        let reader_frames = Arc::clone(&frames);
+        let reader = thread::spawn(move || read_frames(&stream, &events_tx, &reader_frames));
 
         let frame = vec![7u8; GRAYSCALE_BYTES];
         let mut message = vec![TAG_FRAME];
         message.extend_from_slice(&frame);
         client.write_all(&message).unwrap();
         assert!(matches!(events_rx.recv().unwrap(), Event::FrameReady));
-        let received = frame_rx.recv().unwrap();
+        let received = frames.take().unwrap();
         assert_eq!(received.len(), GRAYSCALE_BYTES);
-        spare_tx.send(received).unwrap();
+        frames.recycle(received);
 
         client.write_all(&[TAG_INPUT, b'h', b'i']).unwrap();
         match events_rx.recv().unwrap() {
@@ -551,14 +614,25 @@ mod tests {
     }
 
     #[test]
+    fn newest_frame_replaces_the_pending_one() {
+        let frames = FrameMailbox::new();
+        assert!(frames.put(vec![1u8; GRAYSCALE_BYTES]));
+        assert!(!frames.put(vec![2u8; GRAYSCALE_BYTES]));
+        assert!(frames.has_frame());
+
+        let newest = frames.take().unwrap();
+        assert_eq!(newest[0], 2);
+        assert!(!frames.has_frame());
+    }
+
+    #[test]
     fn oversized_frames_are_dropped() {
         let (server, mut client) = Socket::pair(Domain::UNIX, Type::SEQPACKET, None).unwrap();
         let stream = socket_into_stream(server).unwrap();
 
         let (events_tx, events_rx) = mpsc::channel();
-        let (frame_tx, _frame_rx) = mpsc::sync_channel(1);
-        let (_spare_tx, spare_rx) = mpsc::sync_channel(1);
-        let reader = thread::spawn(move || read_frames(&stream, &events_tx, &frame_tx, &spare_rx));
+        let frames = Arc::new(FrameMailbox::new());
+        let reader = thread::spawn(move || read_frames(&stream, &events_tx, &frames));
 
         client
             .write_all(&vec![TAG_FRAME; FRAME_MESSAGE_BYTES + 1])
