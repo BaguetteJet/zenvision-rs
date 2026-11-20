@@ -27,6 +27,34 @@ pub enum Status {
     Ended,
 }
 
+/// Deterministic xorshift generator shared by the animations.
+///
+/// Seeding it with a constant lets identical options replay identical frames.
+struct Rng(u64);
+
+impl Rng {
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn next_f32(&mut self) -> f32 {
+        (self.next_u64() >> 40) as f32 / 16_777_216.0
+    }
+
+    fn range(&mut self, lo: f32, hi: f32) -> f32 {
+        lo + (hi - lo) * self.next_f32()
+    }
+
+    fn chance(&mut self, p: f32) -> bool {
+        self.next_f32() < p
+    }
+}
+
 /// A drawable animation.
 pub trait Animation {
     /// Advance by `dt` and draw into `canvas`.

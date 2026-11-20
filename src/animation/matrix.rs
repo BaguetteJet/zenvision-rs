@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Animation, Status};
+use super::{Animation, Rng, Status};
 use crate::canvas::{Canvas, HEIGHT, WIDTH};
 
 mod glyphs;
@@ -39,6 +39,12 @@ pub enum GlyphSet {
     Binary,
     /// PlayStation controller symbols
     Playstation,
+    /// Mathematical operators and symbols
+    Maths,
+    /// Printable ASCII
+    Ascii,
+    /// Minecraft enchantment runes
+    Minecraft,
 }
 
 /// Matrix rain tuning, shared by the CLI, IPC and the state file.
@@ -108,6 +114,9 @@ impl Matrix {
             GlyphSet::Katakana => glyphs::KATAKANA,
             GlyphSet::Binary => glyphs::BINARY,
             GlyphSet::Playstation => glyphs::PLAYSTATION,
+            GlyphSet::Maths => glyphs::MATHS,
+            GlyphSet::Ascii => glyphs::ASCII,
+            GlyphSet::Minecraft => glyphs::MINECRAFT,
         };
         let max_offset = (WIDTH - (columns - 1) * cell - glyphs::CELL_WIDTH) as i32;
         let offset = max_offset / 2;
@@ -222,27 +231,6 @@ fn glyph_index(column: usize, cell: i32, count: usize) -> usize {
     (value % count as u64) as usize
 }
 
-struct Rng(u64);
-
-impl Rng {
-    fn next_u64(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    fn next_f32(&mut self) -> f32 {
-        (self.next_u64() >> 40) as f32 / 16_777_216.0
-    }
-
-    fn range(&mut self, lo: f32, hi: f32) -> f32 {
-        lo + (hi - lo) * self.next_f32()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +313,9 @@ mod tests {
             (GlyphSet::Katakana, 61),
             (GlyphSet::Binary, 2),
             (GlyphSet::Playstation, 4),
+            (GlyphSet::Maths, 33),
+            (GlyphSet::Ascii, 94),
+            (GlyphSet::Minecraft, 26),
         ];
 
         for (glyphs, count) in cases {
@@ -333,6 +324,13 @@ mod tests {
                 ..Options::default()
             });
             assert_eq!(matrix.atlas.len(), count);
+            assert!(
+                matrix
+                    .atlas
+                    .iter()
+                    .all(|glyph| glyph.iter().any(|&row| row != 0)),
+                "{glyphs:?} contains an empty glyph"
+            );
         }
     }
 
@@ -357,22 +355,31 @@ mod tests {
     }
 
     #[test]
-    fn cli_selects_the_binary_set() {
+    fn cli_selects_glyph_sets() {
         use clap::{Command, FromArgMatches as _, Subcommand as _};
 
         use crate::animation::AnimationKind;
 
-        let command = AnimationKind::augment_subcommands(Command::new("anim"));
-        let matches = command
-            .try_get_matches_from(["anim", "matrix", "--glyphs", "binary"])
-            .unwrap();
+        for (name, glyphs) in [
+            ("katakana", GlyphSet::Katakana),
+            ("binary", GlyphSet::Binary),
+            ("playstation", GlyphSet::Playstation),
+            ("maths", GlyphSet::Maths),
+            ("ascii", GlyphSet::Ascii),
+            ("minecraft", GlyphSet::Minecraft),
+        ] {
+            let command = AnimationKind::augment_subcommands(Command::new("anim"));
+            let matches = command
+                .try_get_matches_from(["anim", "matrix", "--glyphs", name])
+                .unwrap();
 
-        assert_eq!(
-            AnimationKind::from_arg_matches(&matches).unwrap(),
-            AnimationKind::Matrix(Options {
-                glyphs: GlyphSet::Binary,
-                ..Options::default()
-            })
-        );
+            assert_eq!(
+                AnimationKind::from_arg_matches(&matches).unwrap(),
+                AnimationKind::Matrix(Options {
+                    glyphs,
+                    ..Options::default()
+                })
+            );
+        }
     }
 }
