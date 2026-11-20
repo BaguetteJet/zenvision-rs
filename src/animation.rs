@@ -89,6 +89,8 @@ macro_rules! animations {
 animations! {
     /// Warp-speed starfield
     starfield => Starfield,
+    /// Falling katakana rain
+    matrix => Matrix,
 }
 
 impl Default for AnimationKind {
