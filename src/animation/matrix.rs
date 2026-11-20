@@ -2,7 +2,8 @@
 //!
 //! The glyphs are a fixed 9x10 bitmap atlas, so the animation has no font or
 //! rasterizer dependency. Columns are independent; each one falls at a constant
-//! speed and fades from a bright head toward the tail.
+//! speed and fades from a bright head toward the tail. The whole field also
+//! drifts a few pixels every minute to spread wear on OLED panels.
 
 use std::io;
 use std::time::Duration;
@@ -23,6 +24,9 @@ pub const MAX_SPEED: u16 = 400;
 
 /// The Python applet uses this level when audio reactivity is disabled.
 const IDLE_LEVEL: f32 = 0.4;
+
+/// How long the field stays at one horizontal offset before drifting.
+const DRIFT_INTERVAL: f32 = 60.0;
 
 /// Selectable glyph sets for the rain.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
@@ -77,6 +81,10 @@ pub struct Matrix {
     cell: usize,
     speed: f32,
     atlas: &'static [[u16; glyphs::CELL_HEIGHT]],
+    offset: i32,
+    max_offset: i32,
+    drift_direction: i32,
+    drift_elapsed: f32,
 }
 
 impl Matrix {
@@ -89,7 +97,10 @@ impl Matrix {
         let tail = HEIGHT / cell + 3;
 
         let mut rng = Rng(0xd1b5_4a32_d192_ed03);
-        let heads = (0..WIDTH / cell)
+        // Give up one column so the whole field can drift across a useful
+        // margin without clipping glyphs at either edge.
+        let columns = (WIDTH / cell).saturating_sub(1);
+        let heads = (0..columns)
             .map(|_| rng.range(-(HEIGHT as f32), 0.0))
             .collect();
         let levels = (0..tail).map(|index| fade_level(index, tail)).collect();
@@ -98,6 +109,8 @@ impl Matrix {
             GlyphSet::Binary => glyphs::BINARY,
             GlyphSet::Playstation => glyphs::PLAYSTATION,
         };
+        let max_offset = (WIDTH - (columns - 1) * cell - glyphs::CELL_WIDTH) as i32;
+        let offset = max_offset / 2;
 
         Self {
             heads,
@@ -106,7 +119,27 @@ impl Matrix {
             cell,
             speed,
             atlas,
+            offset,
+            max_offset,
+            drift_direction: 1,
+            drift_elapsed: 0.0,
         }
+    }
+
+    /// Nudge every column sideways to minimize OLED burn-in. Moving in small
+    /// steps and reversing at the edges keeps the motion from reading as a jump.
+    fn drift(&mut self) {
+        if self.max_offset == 0 {
+            return;
+        }
+
+        let step = 1 + (self.rng.next_u64() % 2) as i32;
+        let mut next = self.offset + self.drift_direction * step;
+        if !(0..=self.max_offset).contains(&next) {
+            self.drift_direction = -self.drift_direction;
+            next = self.offset + self.drift_direction * step;
+        }
+        self.offset = next.clamp(0, self.max_offset);
     }
 }
 
@@ -114,10 +147,17 @@ impl Animation for Matrix {
     fn draw(&mut self, canvas: &mut Canvas, dt: Duration) -> io::Result<Status> {
         canvas.clear();
 
-        let dt = dt.as_secs_f32().min(0.1);
+        let elapsed = dt.as_secs_f32();
+        let dt = elapsed.min(0.1);
         let step = self.cell as f32;
         let height = HEIGHT as f32;
         let tail = self.levels.len();
+
+        self.drift_elapsed += elapsed;
+        if self.drift_elapsed >= DRIFT_INTERVAL {
+            self.drift_elapsed -= DRIFT_INTERVAL;
+            self.drift();
+        }
 
         for (column, head) in self.heads.iter_mut().enumerate() {
             *head += self.speed * dt;
@@ -125,7 +165,7 @@ impl Animation for Matrix {
                 *head = self.rng.range(-height * 0.5, 0.0);
             }
 
-            let x = (column * self.cell) as i32;
+            let x = (column * self.cell) as i32 + self.offset;
             for (index, &level) in self.levels.iter().enumerate() {
                 let y = *head - index as f32 * step;
                 if y <= -(glyphs::CELL_HEIGHT as f32) || y >= height {
@@ -234,6 +274,37 @@ mod tests {
         }
 
         assert_eq!(first_canvas.pixels(), second_canvas.pixels());
+    }
+
+    #[test]
+    fn horizontal_drift_stays_inside_the_canvas() {
+        for size in MIN_SIZE..=MAX_SIZE {
+            let mut matrix = Matrix::new(Options {
+                size,
+                ..Options::default()
+            });
+            let mut canvas = Canvas::new();
+            let mut offsets = std::collections::BTreeSet::new();
+
+            assert!(
+                matrix.max_offset >= matrix.cell as i32,
+                "size {size} drift is narrower than one cell"
+            );
+            assert_eq!(matrix.offset, matrix.max_offset / 2);
+
+            for _ in 0..100 {
+                matrix.drift_elapsed = DRIFT_INTERVAL;
+                matrix.draw(&mut canvas, Duration::ZERO).unwrap();
+                offsets.insert(matrix.offset);
+
+                let right = (matrix.heads.len() - 1) * matrix.cell
+                    + glyphs::CELL_WIDTH
+                    + matrix.offset as usize;
+                assert!(right <= WIDTH, "size {size}, offset {}", matrix.offset);
+            }
+
+            assert!(offsets.len() > 1, "size {size} never drifted");
+        }
     }
 
     #[test]
