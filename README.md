@@ -4,7 +4,7 @@ Control the ASUS ZenVision OLED panel on Linux.
 
 The daemon owns the panel and animation runtime. External programs only supply pixels, which makes the panel usable from Python or any other process that can write bytes.
 
-## Build & install
+## Build + Install
 
 Requires Rust 1.85 or newer.
 
@@ -37,38 +37,41 @@ zenvision anim starfield --stars 40 --trail 40 --speed 1.5 --fps 30
 The terminal view runs in the alternate screen using Unicode sextant blocks with true grayscale colors, shrinks to fit smaller terminals, never draws wider than the panel's width, restores the previous screen on exit, and leaves no characters behind.
 
 ```sh
-# with the daemon: mirror the panel
+# mirror the panel in terminal
 zenvision preview
 
-# raw frames to stdout for ffplay or mpv; the final "-" means stdin
-zenvision preview --raw | ffplay -f rawvideo -pixel_format gray -video_size 256x64 -framerate 30 -
+# raw frames to stdout for ffplay or mpv
+zenvision preview --raw | ffplay -f rawvideo -pixel_format gray -video_size 256x64 -framerate 60 -
 ```
 
 ## Custom animations
 
-### Socket (LIVE)
+See [`anim.py`](/anim.py) as script example.
+
+### Socket
 
 Connect to `$XDG_RUNTIME_DIR/zenvision-frames.sock` with `AF_UNIX`/`SOCK_SEQPACKET`. **One message is one frame.** Disconnecting (or ten seconds without a frame) releases the display and the daemon resumes its native animation.
 
 Host frames are only shown while the daemon is streaming. Start it with `anim`, `stream`, or `mode 2`.
 
-The contract is deliberately small:
-
-- first byte is a tag: `0` for a frame, `1` for animation input
-- frames are raw 8-bit grayscale, 256 × 64, row-major, one byte per pixel
-- a frame message is 16,385 bytes including the tag
-- input messages are tag + payload and are forwarded to the active animation
+```sh
+# stream over socket using external script
+python anim.py
+```
 
 ### Pipe
 
-Anything that writes bytes works. Frames are paced by the daemon. If the producer sends faster, older frames are dropped:
+Anything that writes bytes works. Frames are paced by the daemon. If the producer sends faster, older frames are dropped. 
 
 ```sh
-python anim.py | zenvision stream --fps 30
-ffmpeg -stream_loop -1 -i clip.gif -vf scale=256:64,format=gray -f rawvideo - | zenvision stream
+# stream with external script using pipe
+python anim.py | zenvision stream
+
+# directly stream gif
+ffmpeg -re -stream_loop -1 -i clip.gif -vf "scale=256:64,format=gray,fps=40" -f rawvideo - | zenvision stream
 ```
 
-`stream` needs the daemon (it forwards tagged frames to the frame socket). The daemon never executes external commands.
+`stream` needs the daemon. The daemon never executes external commands.
 
 ### Native Rust animations
 
