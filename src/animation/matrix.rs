@@ -1,4 +1,4 @@
-//! Falling katakana rain.
+//! Falling glyph rain.
 //!
 //! The glyphs are a fixed 9x10 bitmap atlas, so the animation has no font or
 //! rasterizer dependency. Columns are independent; each one falls at a constant
@@ -24,10 +24,26 @@ pub const MAX_SPEED: u16 = 400;
 /// The Python applet uses this level when audio reactivity is disabled.
 const IDLE_LEVEL: f32 = 0.4;
 
+/// Selectable glyph sets for the rain.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum GlyphSet {
+    /// Katakana, halfwidth katakana and digits
+    #[default]
+    Katakana,
+    /// Binary digits
+    Binary,
+    /// PlayStation controller symbols
+    Playstation,
+}
+
 /// Matrix rain tuning, shared by the CLI, IPC and the state file.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, clap::Args)]
 #[serde(default)]
 pub struct Options {
+    /// Glyph set
+    #[arg(long, value_enum, default_value = "katakana")]
+    pub glyphs: GlyphSet,
     /// Cell spacing in pixels (larger is sparser)
     #[arg(
         long,
@@ -47,6 +63,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            glyphs: GlyphSet::Katakana,
             size: DEFAULT_SIZE,
             speed: DEFAULT_SPEED,
         }
@@ -59,6 +76,7 @@ pub struct Matrix {
     rng: Rng,
     cell: usize,
     speed: f32,
+    atlas: &'static [[u16; glyphs::CELL_HEIGHT]],
 }
 
 impl Matrix {
@@ -75,6 +93,11 @@ impl Matrix {
             .map(|_| rng.range(-(HEIGHT as f32), 0.0))
             .collect();
         let levels = (0..tail).map(|index| fade_level(index, tail)).collect();
+        let atlas = match options.glyphs {
+            GlyphSet::Katakana => glyphs::KATAKANA,
+            GlyphSet::Binary => glyphs::BINARY,
+            GlyphSet::Playstation => glyphs::PLAYSTATION,
+        };
 
         Self {
             heads,
@@ -82,6 +105,7 @@ impl Matrix {
             rng,
             cell,
             speed,
+            atlas,
         }
     }
 }
@@ -108,14 +132,8 @@ impl Animation for Matrix {
                     continue;
                 }
 
-                let glyph = glyph_index(column, (y / step).floor() as i32);
-                draw_glyph(
-                    canvas,
-                    x,
-                    y.floor() as i32,
-                    &glyphs::GLYPHS[glyph],
-                    level,
-                );
+                let glyph = glyph_index(column, (y / step).floor() as i32, self.atlas.len());
+                draw_glyph(canvas, x, y.floor() as i32, &self.atlas[glyph], level);
             }
         }
 
@@ -150,7 +168,7 @@ fn draw_glyph(canvas: &mut Canvas, x: i32, y: i32, glyph: &[u16; glyphs::CELL_HE
 /// Pick a glyph from the column and the screen cell. Keeping the choice tied
 /// to the cell makes characters stable as they fall instead of rerolling every
 /// frame, which is cheaper and much less noisy.
-fn glyph_index(column: usize, cell: i32) -> usize {
+fn glyph_index(column: usize, cell: i32, count: usize) -> usize {
     let mut value = (column as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)
         ^ (cell as i64 as u64).wrapping_mul(0xd6e8_feb8_6659_fd93)
         ^ 0xa076_1d64_78bd_642f;
@@ -161,7 +179,7 @@ fn glyph_index(column: usize, cell: i32) -> usize {
     value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^= value >> 31;
 
-    (value % glyphs::GLYPHS.len() as u64) as usize
+    (value % count as u64) as usize
 }
 
 struct Rng(u64);
@@ -221,11 +239,69 @@ mod tests {
     #[test]
     fn options_round_trip_through_json() {
         let options = Options {
+            glyphs: GlyphSet::Binary,
             size: 12,
             speed: 220,
         };
         let encoded = serde_json::to_string(&options).unwrap();
 
         assert_eq!(serde_json::from_str::<Options>(&encoded).unwrap(), options);
+    }
+
+    #[test]
+    fn glyph_sets_use_the_expected_atlas() {
+        let cases = [
+            (GlyphSet::Katakana, 61),
+            (GlyphSet::Binary, 2),
+            (GlyphSet::Playstation, 4),
+        ];
+
+        for (glyphs, count) in cases {
+            let matrix = Matrix::new(Options {
+                glyphs,
+                ..Options::default()
+            });
+            assert_eq!(matrix.atlas.len(), count);
+        }
+    }
+
+    #[test]
+    fn cli_selects_playstation_symbols() {
+        use clap::{Command, FromArgMatches as _, Subcommand as _};
+
+        use crate::animation::AnimationKind;
+
+        let command = AnimationKind::augment_subcommands(Command::new("anim"));
+        let matches = command
+            .try_get_matches_from(["anim", "matrix", "--glyphs", "playstation"])
+            .unwrap();
+
+        assert_eq!(
+            AnimationKind::from_arg_matches(&matches).unwrap(),
+            AnimationKind::Matrix(Options {
+                glyphs: GlyphSet::Playstation,
+                ..Options::default()
+            })
+        );
+    }
+
+    #[test]
+    fn cli_selects_the_binary_set() {
+        use clap::{Command, FromArgMatches as _, Subcommand as _};
+
+        use crate::animation::AnimationKind;
+
+        let command = AnimationKind::augment_subcommands(Command::new("anim"));
+        let matches = command
+            .try_get_matches_from(["anim", "matrix", "--glyphs", "binary"])
+            .unwrap();
+
+        assert_eq!(
+            AnimationKind::from_arg_matches(&matches).unwrap(),
+            AnimationKind::Matrix(Options {
+                glyphs: GlyphSet::Binary,
+                ..Options::default()
+            })
+        );
     }
 }

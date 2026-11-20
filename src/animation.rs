@@ -89,7 +89,7 @@ macro_rules! animations {
 animations! {
     /// Warp-speed starfield
     starfield => Starfield,
-    /// Falling katakana rain
+    /// Falling glyph rain
     matrix => Matrix,
 }
 

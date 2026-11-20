@@ -1,12 +1,15 @@
-//! 9x10 glyph bitmaps for the matrix animation.
+//! Glyph bitmaps for the matrix animation.
 //!
-//! Rendered from Noto Sans CJK JP Bold at 9 px (SIL OFL 1.1).
-//! Each row is a 9-bit mask; bit 0 is the leftmost pixel.
+//! Every set shares the same 9x10 cell. The katakana and binary glyphs were
+//! rendered from Noto Sans CJK JP Bold at 9 px (SIL OFL 1.1); the PlayStation
+//! symbols are hand-drawn on the same pixel grid. Each row is a 9-bit mask;
+//! bit 0 is the leftmost pixel.
 
 pub const CELL_WIDTH: usize = 9;
 pub const CELL_HEIGHT: usize = 10;
 
-pub const GLYPHS: [[u16; CELL_HEIGHT]; 61] = [
+/// Full-width katakana, halfwidth katakana and digits.
+pub const KATAKANA: &[[u16; CELL_HEIGHT]] = &[
     [ // ア
         0b000000000,
         0b000000000,
@@ -737,6 +740,86 @@ pub const GLYPHS: [[u16; CELL_HEIGHT]; 61] = [
         0b000011000,
         0b000001000,
         0b000001110,
+        0b000000000,
+    ],
+];
+
+/// The binary digits 0 and 1.
+pub const BINARY: &[[u16; CELL_HEIGHT]] = &[
+    [ // 0
+        0b000000000,
+        0b000000000,
+        0b000011110,
+        0b000110011,
+        0b000100001,
+        0b000100001,
+        0b000100001,
+        0b000110011,
+        0b000011110,
+        0b000000000,
+    ],
+    [ // 1
+        0b000000000,
+        0b000000000,
+        0b000001100,
+        0b000001100,
+        0b000001100,
+        0b000001100,
+        0b000001100,
+        0b000001100,
+        0b000001100,
+        0b000000000,
+    ],
+];
+
+/// PlayStation controller symbols: triangle, circle, cross and square.
+pub const PLAYSTATION: &[[u16; CELL_HEIGHT]] = &[
+    [ // △ Triangle
+        0b000000000,
+        0b000000000,
+        0b000010000,
+        0b000101000,
+        0b001000100,
+        0b001000100,
+        0b010000010,
+        0b010000010,
+        0b011111110,
+        0b000000000,
+    ],
+    [ // ○ Circle
+        0b000000000,
+        0b000000000,
+        0b000111000,
+        0b001000100,
+        0b010000010,
+        0b010000010,
+        0b010000010,
+        0b001000100,
+        0b000111000,
+        0b000000000,
+    ],
+    [ // × Cross
+        0b000000000,
+        0b000000000,
+        0b010000010,
+        0b001000100,
+        0b000101000,
+        0b000010000,
+        0b000101000,
+        0b001000100,
+        0b010000010,
+        0b000000000,
+    ],
+    [ // □ Square
+        0b000000000,
+        0b000000000,
+        0b011111110,
+        0b010000010,
+        0b010000010,
+        0b010000010,
+        0b010000010,
+        0b010000010,
+        0b011111110,
         0b000000000,
     ],
 ];
