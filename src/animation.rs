@@ -119,6 +119,8 @@ animations! {
     starfield => Starfield,
     /// Falling glyph rain
     matrix => Matrix,
+    /// Autonomous Pong
+    pong => Pong,
 }
 
 impl Default for AnimationKind {
