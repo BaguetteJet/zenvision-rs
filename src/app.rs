@@ -320,9 +320,7 @@ where
 
         match result {
             Ok(Status::Ended) => {
-                self.state.playing = false;
-                self.save();
-                self.update_preview();
+                let _ = self.play(Some(AnimationKind::default()), None);
             }
             Ok(_) => {}
             Err(error) => self.panel_failed(error),
@@ -706,7 +704,8 @@ pub fn run_animation(panel: &mut dyn Panel, mut player: Player) -> io::Result<()
             }
 
             if player.tick(panel)? == Status::Ended {
-                break;
+                let fps = player.fps();
+                player.play(AnimationKind::default(), fps);
             }
         }
         Ok(())
