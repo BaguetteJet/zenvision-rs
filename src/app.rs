@@ -495,12 +495,7 @@ where
         }
 
         match &command {
-            PanelCommand::On => {
-                self.state.power = Some(true);
-                self.state.theme = Some(Theme::FOUR);
-                self.state.clock = None;
-                self.stop_streaming();
-            }
+            PanelCommand::On => self.state.power = Some(true),
             PanelCommand::Off => {
                 self.state.power = Some(false);
                 self.stop_streaming();
@@ -551,6 +546,28 @@ where
 
         if self.panel.is_none() {
             return Reply::ok();
+        }
+
+        // `on` only restores power; replay the saved animation or built-in
+        // display choice instead of leaving the panel on a default theme.
+        if matches!(command, PanelCommand::On) {
+            let panel = self.panel.as_mut().expect("checked above");
+            let result = self.state.apply(panel.as_mut(), &mut self.player);
+
+            if self.live.active {
+                self.player.pause();
+                self.live.dirty = self.live.has_frame;
+                self.live.next = Instant::now();
+            }
+
+            return match result {
+                Ok(()) => Reply::ok(),
+                Err(error) => {
+                    let message = format!("panel error: {error}");
+                    self.panel_failed(error);
+                    Reply::error(message)
+                }
+            };
         }
 
         match self.panel_apply(&command) {
@@ -730,6 +747,10 @@ mod tests {
         fn commands(&self) -> Vec<PanelCommand> {
             self.0.lock().unwrap().commands.clone()
         }
+
+        fn clear(&self) {
+            self.0.lock().unwrap().commands.clear();
+        }
     }
 
     impl Panel for FakePanel {
@@ -817,6 +838,45 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, PanelCommand::Theme { value } if *value == theme))
         );
+    }
+
+    #[test]
+    fn power_on_restores_saved_display_state() {
+        let theme = Theme::new(3).unwrap();
+        let panel = FakePanel::default();
+        let state = State {
+            playing: true,
+            brightness: Some(90),
+            theme: Some(theme),
+            ..State::default()
+        };
+        let (mut app, _frames, _slot) = test_app(state, Some(panel.clone()));
+        app.try_open();
+        panel.clear();
+
+        let reply = app.apply(Command::Panel(PanelCommand::On));
+        assert!(matches!(reply, Reply::Ok { .. }));
+        assert_eq!(app.state.power, Some(true));
+        assert_eq!(app.state.theme, Some(theme));
+        assert!(app.state.playing);
+
+        let commands = panel.commands();
+        let on = commands
+            .iter()
+            .position(|command| *command == PanelCommand::On)
+            .unwrap();
+        let themed = commands
+            .iter()
+            .position(|command| *command == PanelCommand::Theme { value: theme })
+            .unwrap();
+
+        assert!(on < themed);
+        assert!(commands.contains(&PanelCommand::Mode {
+            value: ContentMode::TWO
+        }));
+        assert!(!commands.iter().any(
+            |command| matches!(command, PanelCommand::Theme { value } if *value == Theme::FOUR)
+        ));
     }
 
     #[test]

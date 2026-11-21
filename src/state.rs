@@ -82,7 +82,7 @@ impl State {
             return Ok(());
         }
 
-        // Power-on selects theme 4 and the battery icon, so replay the saved
+        // Powering on leaves screen blank, so replay the saved
         // display choices after it rather than before.
         if self.power == Some(true) {
             panel.apply(&PanelCommand::On)?;

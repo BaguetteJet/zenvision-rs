@@ -113,7 +113,7 @@ pub const BUILTIN_DISPLAY: PanelCommand = PanelCommand::Clock {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum PanelCommand {
-    /// `30 05 04 00 00 00 03` + `30 05 02 00 04` - power on, battery on, theme 4.
+    /// `30 05 04 00 00 00 03` - power on, battery on.
     On,
     /// `30 05 04 00 00 00 00` + `31 02 00 04` - power off, screen sweep off.
     Off,
@@ -231,10 +231,7 @@ fn power_off() -> Vec<Vec<u8>> {
 
 // Power on
 fn power_on() -> Vec<Vec<u8>> {
-    vec![
-        vec![0x30, 0x05, 0x04, 0x00, 0x00, 0x00, 0x03], // battery on
-        vec![0x30, 0x05, 0x02, 0x00, 0x04],             // theme 4
-    ]
+    vec![vec![0x30, 0x05, 0x04, 0x00, 0x00, 0x00, 0x03]] // battery on
 }
 
 /// Clock time format.
@@ -450,7 +447,10 @@ mod tests {
 
     #[test]
     fn power_and_streaming_emit_expected_sequences() {
-        assert_eq!(PanelCommand::On.payloads(time()).len(), 2);
+        assert_eq!(
+            PanelCommand::On.payloads(time()),
+            vec![vec![0x30, 0x05, 0x04, 0x00, 0x00, 0x00, 0x03]]
+        );
         assert_eq!(PanelCommand::Off.payloads(time()).len(), 2);
 
         assert_eq!(
