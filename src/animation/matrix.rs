@@ -1,6 +1,6 @@
 //! Falling glyph rain.
 //!
-//! The glyphs are a fixed 9x10 bitmap atlas, so the animation has no font or
+//! The glyphs are a fixed 9x9 bitmap atlas, so the animation has no font or
 //! rasterizer dependency. Columns are independent; each one falls at a constant
 //! speed and fades from a bright head toward the tail. The whole field also
 //! drifts a few pixels every minute to spread wear on OLED panels.
