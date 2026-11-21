@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Animation, Status};
+use super::{Animation, Rng, Status};
 use crate::canvas::{Canvas, HEIGHT, WIDTH};
 
 const PADDLE_H: f32 = 12.0;
@@ -38,12 +38,13 @@ pub struct Pong {
     right_y: f32,
     left_score: u8,
     right_score: u8,
+    rng: Rng,
     points: u8,
 }
 
 impl Pong {
     pub fn new(options: Options) -> Self {
-        Self {
+        let mut game = Self {
             ball_x: WIDTH as f32 / 2.0,
             ball_y: HEIGHT as f32 / 2.0,
             vel_x: BALL_SPEED,
@@ -52,15 +53,30 @@ impl Pong {
             right_y: HEIGHT as f32 / 2.0,
             left_score: 0,
             right_score: 0,
+            rng: Rng(0x706f_6e67_5d8f_2a31),
             points: options.points.max(1),
-        }
+        };
+        game.reset();
+        game
     }
 
-    fn reset_ball(&mut self, direction: f32) {
+    /// Put the ball, paddles and score back to the opening state.
+    fn reset(&mut self) {
+        self.left_y = HEIGHT as f32 / 2.0;
+        self.right_y = HEIGHT as f32 / 2.0;
+        self.left_score = 0;
+        self.right_score = 0;
+        self.reset_ball();
+    }
+
+    fn reset_ball(&mut self) {
         self.ball_x = WIDTH as f32 / 2.0;
         self.ball_y = HEIGHT as f32 / 2.0;
+
+        let direction = if self.rng.chance(0.5) { 1.0 } else { -1.0 };
+        let angle = self.rng.range(0.15, 0.45) * if self.rng.chance(0.5) { 1.0 } else { -1.0 };
         self.vel_x = BALL_SPEED * direction;
-        self.vel_y = BALL_SPEED * 0.4;
+        self.vel_y = BALL_SPEED * angle;
     }
 
     fn move_ai(paddle: &mut f32, target: f32, dt: f32) {
@@ -134,17 +150,15 @@ impl Animation for Pong {
         if self.ball_x < 0.0 {
             self.right_score += 1;
             if self.right_score >= self.points {
-                self.left_score = 0;
-                self.right_score = 0;
+                return Ok(Status::Ended);
             }
-            self.reset_ball(-1.0);
+            self.reset_ball();
         } else if self.ball_x >= WIDTH as f32 {
             self.left_score += 1;
             if self.left_score >= self.points {
-                self.left_score = 0;
-                self.right_score = 0;
+                return Ok(Status::Ended);
             }
-            self.reset_ball(1.0);
+            self.reset_ball();
         }
 
         canvas.clear();
@@ -182,5 +196,60 @@ impl Animation for Pong {
         Self::digit(canvas, WIDTH as i32 / 2 + 6, 2, self.right_score);
 
         Ok(Status::New)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn game_reset_restores_the_opening_state() {
+        let mut game = Pong::new(Options { points: 2 });
+        game.ball_x = 10.0;
+        game.ball_y = 12.0;
+        game.left_y = 20.0;
+        game.right_y = 30.0;
+        game.left_score = 2;
+        game.right_score = 1;
+
+        game.reset();
+
+        assert_eq!(game.ball_x, WIDTH as f32 / 2.0);
+        assert_eq!(game.ball_y, HEIGHT as f32 / 2.0);
+        assert_eq!(game.left_y, HEIGHT as f32 / 2.0);
+        assert_eq!(game.right_y, HEIGHT as f32 / 2.0);
+        assert_eq!(game.left_score, 0);
+        assert_eq!(game.right_score, 0);
+        assert_ne!(game.vel_x, 0.0);
+        assert_ne!(game.vel_y, 0.0);
+    }
+
+    #[test]
+    fn reaching_the_target_score_ends_the_animation() {
+        let mut game = Pong::new(Options { points: 2 });
+        game.right_score = 1;
+        game.ball_x = -1.0;
+        game.ball_y = 0.0;
+        game.vel_x = -BALL_SPEED;
+
+        let status = game
+            .draw(&mut Canvas::new(), Duration::from_millis(16))
+            .unwrap();
+
+        assert_eq!(status, Status::Ended);
+    }
+
+    #[test]
+    fn serves_vary_between_resets() {
+        let mut game = Pong::new(Options::default());
+        let mut serves = Vec::new();
+
+        for _ in 0..16 {
+            game.reset();
+            serves.push((game.vel_x, game.vel_y));
+        }
+
+        assert!(serves.windows(2).any(|pair| pair[0] != pair[1]));
     }
 }
