@@ -5,7 +5,7 @@ Description=ZenVision lid display daemon
 Type=simple
 ExecStart=%h/.local/bin/zenvision daemon
 Restart=on-failure
-RestartSec=3
+RestartSec=2
 
 [Install]
 WantedBy=default.target
