@@ -17,6 +17,8 @@ pub struct State {
     pub animation: AnimationKind,
     pub fps: Fps,
     /// False by default so a fresh install leaves the built-in display alone.
+    /// This is the last selected content, not the current power state, so it
+    /// survives `off` and lets `on` restore the animation.
     pub playing: bool,
     /// `None` until the user sets a brightness, so a fresh install leaves the
     /// panel's own default alone.

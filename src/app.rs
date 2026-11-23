@@ -329,7 +329,7 @@ where
 
     fn display_live(&mut self) {
         let frame = self.frames.take();
-        let displaying = self.panel.is_some() && self.state.playing;
+        let displaying = self.panel.is_some() && self.state.playing && self.powered_on();
         let mut result = Ok(());
 
         if displaying && (frame.is_some() || (self.live.dirty && self.live.has_frame)) {
@@ -381,7 +381,7 @@ where
         let was_active = self.live.active;
         self.frames.clear();
         self.live.clear();
-        if self.state.playing {
+        if self.state.playing && self.powered_on() {
             self.player.resume();
         } else {
             self.player.pause();
@@ -496,7 +496,10 @@ where
             PanelCommand::On => self.state.power = Some(true),
             PanelCommand::Off => {
                 self.state.power = Some(false);
-                self.stop_streaming();
+                // Keep `playing` so `on` can restore the animation that was
+                // showing; only stop driving the panel for now.
+                self.player.pause();
+                self.live.dirty = false;
             }
             PanelCommand::Theme { value } => {
                 self.state.theme = Some(*value);
@@ -632,8 +635,12 @@ where
     /// actually receiving them.
     fn update_preview(&self) {
         if let Some(preview) = &self.preview {
-            preview.set_streaming(self.state.playing && self.panel.is_some());
+            preview.set_streaming(self.state.playing && self.panel.is_some() && self.powered_on());
         }
+    }
+
+    fn powered_on(&self) -> bool {
+        self.state.power != Some(false)
     }
 
     fn save(&self) {
@@ -649,7 +656,7 @@ where
         // Only replace host frames. A theme, clock, or powered-off panel is
         // already a built-in display and should be left alone. Stopping the
         // daemon returns the panel to the built-in theme.
-        if self.state.playing {
+        if self.state.playing && self.powered_on() {
             if let Some(panel) = self.panel.as_mut() {
                 let theme = PanelCommand::Theme { value: Theme::FOUR };
                 if let Err(error) = panel.apply(&theme) {
@@ -879,6 +886,48 @@ mod tests {
     }
 
     #[test]
+    fn power_on_restores_the_animation_that_was_playing_before_off() {
+        let panel = FakePanel::default();
+        let (mut app, _frames, _slot) = test_app(playing_state(), Some(panel.clone()));
+        app.try_open();
+        panel.clear();
+
+        let reply = app.apply(Command::Panel(PanelCommand::Off));
+        assert!(matches!(reply, Reply::Ok { .. }));
+        assert_eq!(app.state.power, Some(false));
+        assert!(app.state.playing, "off must keep the last display choice");
+
+        app.on_deadline();
+        assert_eq!(panel.frames(), 0);
+
+        let reply = app.apply(Command::Panel(PanelCommand::On));
+        assert!(matches!(reply, Reply::Ok { .. }));
+        assert_eq!(app.state.power, Some(true));
+
+        app.on_deadline();
+        assert!(panel.frames() > 0);
+        assert!(panel.commands().contains(&PanelCommand::Mode {
+            value: ContentMode::TWO
+        }));
+    }
+
+    #[test]
+    fn live_frames_wait_while_powered_off() {
+        let panel = FakePanel::default();
+        let (mut app, frames, _slot) = test_app(playing_state(), Some(panel.clone()));
+        app.try_open();
+        app.apply(Command::Panel(PanelCommand::Off));
+        panel.clear();
+
+        frames.put(vec![7u8; GRAYSCALE_BYTES]);
+        app.handle(Event::FrameReady);
+        app.live.next = Instant::now();
+        app.on_deadline();
+
+        assert_eq!(panel.frames(), 0);
+    }
+
+    #[test]
     fn offline_momentary_command_is_rejected() {
         let (mut app, _frames, _slot) = test_app(State::default(), None);
         app.try_open();
@@ -981,6 +1030,15 @@ mod tests {
         app.shutdown();
 
         assert!(panel.commands().contains(&theme));
+
+        let panel = FakePanel::default();
+        let (mut app, _frames, _slot) = test_app(playing_state(), Some(panel.clone()));
+        app.try_open();
+        app.apply(Command::Panel(PanelCommand::Off));
+        panel.clear();
+        app.shutdown();
+
+        assert!(!panel.commands().contains(&theme));
 
         let panel = FakePanel::default();
         let (mut app, _frames, _slot) = test_app(State::default(), Some(panel.clone()));
